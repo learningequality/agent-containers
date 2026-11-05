@@ -169,8 +169,16 @@ def git_dirs(worktree: Path) -> tuple[Path, ...]:
         printed = result.stdout.strip()
         return (root / printed).resolve() if result.returncode == 0 and printed else None
 
+    own = rev_parse("--absolute-git-dir")
+    if own is not None and not own.is_relative_to(root):
+        try:
+            points_back = (own / "gitdir").read_text().strip()
+        except OSError:
+            points_back = ""
+        if not points_back or (own / points_back).resolve() != root / ".git":
+            raise ToolError(f"{root / '.git'} names {own}, which does not belong to this worktree")
     found: list[Path] = []
-    for directory in (rev_parse("--git-common-dir"), rev_parse("--absolute-git-dir")):
+    for directory in (rev_parse("--git-common-dir"), own):
         if directory is None or directory.is_relative_to(root):
             continue
         if not any(directory.is_relative_to(kept) for kept in found):

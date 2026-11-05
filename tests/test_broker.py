@@ -1,50 +1,16 @@
 import io
 import json
-import os
 import subprocess
 import threading
 import time
 
 import pytest
+from fakes import FakeInstance
 
 from agent_containers import broker as brokers
 from agent_containers import client
 from agent_containers.declaration import parse
 from agent_containers.errors import EXIT_TOOL_ERROR
-from agent_containers.instance import Served
-
-
-class FakeInstance:
-    def __init__(self, target):
-        self.target = target
-        self.calls = []
-        self.killed = threading.Event()
-
-    def run(self, argv, *, cwd="", stdout=None, stderr=None, group=None):
-        self.calls.append(("run", argv, cwd))
-        if argv == ["block"]:
-            self.killed.wait(10)
-            return 143
-        os.write(stdout.fileno(), b"out:" + " ".join(argv).encode() + b"\n")
-        os.write(stderr.fileno(), b"err-line\n")
-        return int(argv[-1]) if argv[-1].isdigit() else 0
-
-    def up(self):
-        self.calls.append(("up",))
-
-    def kill(self, group):
-        self.calls.append(("kill", group))
-        self.killed.set()
-
-    def serve(self):
-        self.calls.append(("serve",))
-        return Served(urls={8000: "http://127.0.0.1:30000"}, log=".agent-containers/web/serve.log")
-
-    def stop(self, *, purge=False):
-        self.calls.append(("stop", purge))
-
-    def status(self):
-        return {"ac-x-web": "target running"}
 
 
 @pytest.fixture
@@ -229,11 +195,8 @@ def _config(worktree, key, value):
 
 
 def test_the_repo_and_git_dirs_are_fixed_when_the_broker_starts(tmp_path, monkeypatch):
-    for bare in ("one.git", "two.git"):
-        subprocess.run(["git", "init", "-q", "--bare", str(tmp_path / bare)], check=True)
     worktree = tmp_path / "wt"
-    worktree.mkdir()
-    (worktree / ".git").write_text(f"gitdir: {tmp_path / 'one.git'}\n")
+    subprocess.run(["git", "init", "-q", str(worktree)], check=True)
     _config(worktree, "remote.origin.url", "git@github.com:learningequality/kdp.git")
     captured = {}
     declaration = parse("services:\n  app:\n    build: .\n    x-agent: {}\n")
@@ -243,7 +206,6 @@ def test_the_repo_and_git_dirs_are_fixed_when_the_broker_starts(tmp_path, monkey
     made = brokers.Broker(worktree, None, "test", "task1")
     made.start()
     try:
-        (worktree / ".git").write_text(f"gitdir: {tmp_path / 'two.git'}\n")
         _config(worktree, "remote.upstream.url", "https://github.com/attacker/repo")
         _submit(worktree, "r1", {"command": "status", "target": "app", "argv": [], "cwd": ""})
         made.poll_once()
@@ -251,24 +213,20 @@ def test_the_repo_and_git_dirs_are_fixed_when_the_broker_starts(tmp_path, monkey
     finally:
         made.close()
     assert captured["repo"] == "learningequality/kdp"
-    assert str(tmp_path / "two.git") not in {str(d) for d in captured["git_dirs"]}
+    assert captured["git_dirs"] == ()
 
 
-def test_a_closed_broker_leaves_a_heartbeat_that_reads_as_stale(tmp_path):
+def test_a_closed_broker_reads_as_not_answering(tmp_path):
     made = brokers.Broker(tmp_path, None, "test", None, factory=FakeInstance, targets=("web",))
     made.start()
     made.close()
-    assert client.broker_known(tmp_path)
     assert not client.broker_alive(tmp_path)
 
 
-def test_a_stale_heartbeat_tells_the_client_to_start_the_broker(tmp_path):
-    alive = _dir(tmp_path, "alive")
-    alive.parent.mkdir(parents=True)
-    alive.write_text("0")
-    old = time.time() - 60
-    os.utime(alive, (old, old))
-    assert not client.broker_alive(tmp_path)
+def test_an_unanswered_request_is_withdrawn_and_names_the_install(tmp_path, monkeypatch):
+    monkeypatch.setattr(client, "PICKUP_WAIT", 0.5)
     err = io.BytesIO()
     assert client.request(tmp_path, "run", "web", ["ls"], "", out=io.BytesIO(), err=err) == EXIT_TOOL_ERROR
-    assert b"agent-containers broker" in err.getvalue()
+    assert b"agent-containers install" in err.getvalue()
+    assert list(_dir(tmp_path, "requests").iterdir()) == []
+    assert (tmp_path / ".agent-containers" / ".gitignore").read_text() == "*\n"

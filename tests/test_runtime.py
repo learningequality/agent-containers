@@ -161,15 +161,20 @@ def _git(cwd, *args):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
-def test_linked_worktree_mounts_its_git_file_and_common_dir_read_only(tmp_path):
-    bare = tmp_path / "project" / ".bare"
-    _git(tmp_path, "init", "-q", "--bare", str(bare))
-    seed = tmp_path / "seed"
-    _git(tmp_path, "clone", "-q", str(bare), str(seed))
+def _linked_worktree(parent, name):
+    bare = parent / name / ".bare"
+    _git(parent, "init", "-q", "--bare", str(bare))
+    seed = parent / f"{name}-seed"
+    _git(parent, "clone", "-q", str(bare), str(seed))
     _git(seed, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "x")
     _git(seed, "push", "-q", "origin", "HEAD:main")
-    worktree = tmp_path / "project" / "feature"
+    worktree = parent / name / "feature"
     _git(bare, "worktree", "add", "-q", str(worktree), "main")
+    return bare, worktree
+
+
+def test_linked_worktree_mounts_its_git_file_and_common_dir_read_only(tmp_path):
+    bare, worktree = _linked_worktree(tmp_path, "project")
 
     mounts = dict(runtime.git_mounts(worktree, "/work"))
 
@@ -189,19 +194,24 @@ def test_a_symlinked_dot_git_is_refused(tmp_path):
 
 
 def test_git_mounts_take_the_dirs_recorded_earlier_over_a_rewritten_dot_git(tmp_path):
-    first, second = tmp_path / "one.git", tmp_path / "two.git"
-    _git(tmp_path, "init", "-q", "--bare", str(first))
-    _git(tmp_path, "init", "-q", "--bare", str(second))
-    worktree = tmp_path / "wt"
-    worktree.mkdir()
-    (worktree / ".git").write_text(f"gitdir: {first}\n")
+    first, worktree = _linked_worktree(tmp_path, "one")
+    second, _ = _linked_worktree(tmp_path, "two")
     recorded = runtime.git_dirs(worktree)
-    (worktree / ".git").write_text(f"gitdir: {second}\n")
+    (worktree / ".git").write_text(f"gitdir: {second}/worktrees/feature\n")
 
     sources = {source for source, _ in runtime.git_mounts(worktree, "/work", recorded)}
 
-    assert str(second) not in sources
-    assert str(first) in sources
+    assert str(second.resolve()) not in sources
+    assert str(first.resolve()) in sources
+
+
+@pytest.mark.parametrize("planted", ["{other}", "{other}/worktrees/feature"])
+def test_a_dot_git_pointing_at_a_repo_that_does_not_point_back_is_refused(tmp_path, planted):
+    _, worktree = _linked_worktree(tmp_path, "mine")
+    other, _ = _linked_worktree(tmp_path, "other")
+    (worktree / ".git").write_text(f"gitdir: {planted.format(other=other)}\n")
+    with pytest.raises(runtime.ToolError, match="does not belong"):
+        runtime.git_dirs(worktree)
 
 
 @pytest.mark.parametrize("name", ["podman", "docker"])

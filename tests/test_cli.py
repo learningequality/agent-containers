@@ -7,6 +7,7 @@ import pytest
 from agent_containers import cli
 from agent_containers import images
 from agent_containers.errors import EXIT_TOOL_ERROR
+from agent_containers.errors import ToolError
 from agent_containers.runtime import Runtime
 
 
@@ -52,16 +53,38 @@ def test_a_termination_signal_cancels_a_brokered_command_like_ctrl_c(signum):
             signal.signal(s, handler)
 
 
-def test_a_worktree_whose_broker_went_away_says_to_restart_it(tmp_path, monkeypatch, capsys):
+def _direct_mode_marker(*args, **kwargs):
+    raise ToolError("ran directly")
+
+
+@pytest.mark.parametrize(
+    ("alive", "usable", "mode"),
+    [(True, True, "service"), (False, True, "direct"), (False, False, "service")],
+)
+def test_the_cli_uses_the_service_when_it_answers_or_no_runtime_works(
+    tmp_path, monkeypatch, capsys, alive, usable, mode
+):
     _git(tmp_path, "init", "-q")
-    alive = tmp_path / ".agent-containers" / "broker" / "alive"
-    alive.parent.mkdir(parents=True)
-    alive.write_text("0")
-    os.utime(alive, (0, 0))
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.client, "broker_alive", lambda worktree: alive)
+    monkeypatch.setattr(cli, "runtime_usable", lambda name: usable)
+    monkeypatch.setattr(cli, "detect", lambda name: Runtime("podman"))
+    monkeypatch.setattr(cli, "prepare", _direct_mode_marker)
+    monkeypatch.setattr(cli.client, "request", lambda *args, **kwargs: 42)
+
+    code = cli.main(["run", "--", "true"])
+
+    assert (code, "ran directly" in capsys.readouterr().err) == ((42, False) if mode == "service" else (125, True))
+
+
+def test_with_no_runtime_and_no_service_the_cli_names_the_install(tmp_path, monkeypatch, capsys):
+    _git(tmp_path, "init", "-q")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "runtime_usable", lambda name: False)
+    monkeypatch.setattr(cli.client, "PICKUP_WAIT", 0.5)
 
     assert cli.main(["run", "--", "true"]) == EXIT_TOOL_ERROR
-    assert "agent-containers broker" in capsys.readouterr().err
+    assert "agent-containers install" in capsys.readouterr().err
 
 
 def test_run_needs_a_command(tmp_path, monkeypatch, capsys):

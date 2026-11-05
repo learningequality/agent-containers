@@ -9,7 +9,9 @@ import sys
 from pathlib import Path
 
 from agent_containers import client
-from agent_containers.broker import Broker
+from agent_containers import config
+from agent_containers import service
+from agent_containers.daemon import Daemon
 from agent_containers.declaration import parse
 from agent_containers.errors import EXIT_TOOL_ERROR
 from agent_containers.errors import ToolError
@@ -60,6 +62,13 @@ def worktree_and_cwd() -> tuple[Path, str]:
     return root, "" if relative == "." else relative
 
 
+def runtime_usable(name: str | None) -> bool:
+    try:
+        return detect(name).run(["info"], what="runtime info", check=False, timeout=30).returncode == 0
+    except ToolError:
+        return False
+
+
 def cancel_on_termination() -> None:
     def interrupt(signum, frame):
         raise KeyboardInterrupt
@@ -88,14 +97,18 @@ def _parser() -> argparse.ArgumentParser:
     stop.add_argument("--purge", action="store_true", help="also remove volumes")
     commands.add_parser("status", help="list this worktree's containers")
     commands.add_parser("reap", help="remove this namespace's instances whose worktree is gone")
-    broker = commands.add_parser("broker", help="serve requests from a sandboxed agent in this worktree")
-    broker.add_argument("--repo", help="owner/name; default: the worktree's upstream, then origin remote")
-    broker.add_argument("--instance", help="instance id prefix; default: one per worktree and target")
+    install = commands.add_parser("install", help="choose the folders agents may run worktrees from; start the service")
+    install.add_argument("--root", action="append", default=[], help="a folder to allow (repeatable); skips the prompt")
+    commands.add_parser("uninstall", help="stop and remove the service")
+    roots = commands.add_parser("roots", help="list, add or remove the folders agents may run worktrees from")
+    roots.add_argument("action", nargs="?", choices=("add", "remove"))
+    roots.add_argument("paths", nargs="*")
+    commands.add_parser("daemon", help="serve every worktree under the roots (what the service runs)")
     plan = commands.add_parser("build-plan", help="print how CI builds a target, as JSON")
     plan.add_argument("target")
     plan.add_argument("--compose-file", default=COMPOSE_FILE)
     plan.add_argument("--paths", default="", help="extra watched globs, space-separated")
-    for sub in (run, serve, stop, commands.choices["status"], commands.choices["reap"], broker):
+    for sub in (run, serve, stop, commands.choices["status"], commands.choices["reap"]):
         sub.add_argument("--runtime", choices=("podman", "docker"))
     return parser
 
@@ -120,11 +133,11 @@ def _dispatch(args: argparse.Namespace, command: list[str]) -> int:
     if args.command == "build-plan":
         print(json.dumps(build_plan(Path(args.compose_file), args.target, args.paths.split())))
         return 0
+    if args.command in ("install", "uninstall", "roots", "daemon"):
+        return _manage(args)
     worktree, cwd = worktree_and_cwd()
-    if args.command in BROKERED and client.broker_known(worktree):
+    if args.command in BROKERED and (client.broker_alive(worktree) or not runtime_usable(args.runtime)):
         return _through_broker(args, worktree, cwd, command)
-    if args.command == "broker":
-        return _serve_broker(args, worktree)
     runtime = detect(args.runtime)
     scope = {LABEL_NAMESPACE: namespace(), LABEL_WORKTREE: str(worktree)}
     if args.command == "run":
@@ -163,7 +176,7 @@ def _dispatch(args: argparse.Namespace, command: list[str]) -> int:
 def _through_broker(args: argparse.Namespace, worktree: Path, cwd: str, command: list[str]) -> int:
     fixed = [f"--{name}" for name in BROKER_FIXED if getattr(args, name, None)]
     if fixed:
-        raise ToolError(f"the broker serving this worktree fixed {', '.join(fixed)} when it started; drop them")
+        raise ToolError(f"the agent-containers service fixes {', '.join(fixed)} for this worktree; drop them")
     if args.command == "run" and not command:
         raise ToolError("run needs a command after --")
     cancel_on_termination()
@@ -178,15 +191,48 @@ def _through_broker(args: argparse.Namespace, worktree: Path, cwd: str, command:
     )
 
 
-def _serve_broker(args: argparse.Namespace, worktree: Path) -> int:
-    served = Broker(worktree, args.repo, namespace(), args.instance, runtime=args.runtime)
-    served.start()
-    print(f"agent-containers broker serving {worktree}; Ctrl-C stops it", file=sys.stderr)
-    try:
-        served.serve_forever()
-    finally:
-        served.close()
+def _manage(args: argparse.Namespace) -> int:
+    if args.command == "install":
+        roots = args.root or _prompt_roots()
+        if not roots and not config.load_roots():
+            raise ToolError("no folders to allow; pass --root or answer the prompt")
+        for root in config.add_roots(roots):
+            print(f"root {root}")
+        print(f"service {service.install()}")
+        return 0
+    if args.command == "uninstall":
+        service.uninstall()
+        return 0
+    if args.command == "daemon":
+        serving = Daemon()
+        print("agent-containers daemon serving the configured roots", file=sys.stderr, flush=True)
+        try:
+            serving.serve_forever()
+        finally:
+            serving.close()
+        return 0
+    if args.action == "add":
+        roots = config.add_roots(args.paths)
+    elif args.action == "remove":
+        roots = config.remove_roots(args.paths)
+    else:
+        roots = config.load_roots()
+    for root in roots:
+        print(root)
     return 0
+
+
+def _prompt_roots() -> list[str]:
+    if not sys.stdin.isatty():
+        return []
+    current = config.load_roots()
+    if current:
+        print("Agents may already run worktrees under:\n" + "\n".join(f"  {root}" for root in current))
+    print("Folders where agents may run worktrees, one per line (e.g. ~/github); a blank line finishes:")
+    answers = []
+    while answer := input("> ").strip():
+        answers.append(answer)
+    return answers
 
 
 def _instance(args: argparse.Namespace, worktree: Path, runtime: Runtime) -> Instance:

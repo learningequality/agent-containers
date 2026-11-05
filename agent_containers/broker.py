@@ -107,6 +107,38 @@ def validate(payload: Any, targets: tuple[str, ...]) -> dict[str, Any]:
     return {"command": command, "target": target, "argv": argv, "cwd": "" if normal == "." else normal}
 
 
+def refuse_pending(worktree: Path, message: str) -> None:
+    descriptors: list[int] = []
+    try:
+        descriptors.append(os.open(worktree, os.O_RDONLY | os.O_DIRECTORY))
+        for name in (STATE_DIR, BROKER):
+            descriptors.append(_open_dir(descriptors[-1], name, create=False))
+        broker = descriptors[-1]
+        requests = _open_dir(broker, REQUESTS, create=False)
+        descriptors.append(requests)
+        results = _open_dir(broker, RESULTS, create=True)
+        descriptors.append(results)
+        for name in os.listdir(requests):
+            request_id = name[:-5]
+            if not name.endswith(".json") or not _REQUEST_ID.match(request_id):
+                continue
+            with contextlib.suppress(OSError):
+                os.unlink(name, dir_fd=requests)
+                os.mkdir(request_id, 0o755, dir_fd=results)
+                result = os.open(request_id, _DIR_FLAGS, dir_fd=results)
+                try:
+                    os.close(_write_new(result, "stdout"))
+                    os.close(_write_new(result, "stderr", f"agent-containers: {message}\n".encode()))
+                    _replace(result, "exit", f"{EXIT_TOOL_ERROR}\n".encode())
+                finally:
+                    os.close(result)
+    except OSError:
+        return
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 class Broker:
     def __init__(
         self,

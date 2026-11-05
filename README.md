@@ -1,14 +1,24 @@
 # agent-containers
 
-Run any command in a container your repo defines, per target, for humans, unsandboxed agents, and sandboxed agents through a broker.
+Run any command in a container your repo defines, per target, for you and for your agents, sandboxed or not.
 
 ## Install
 
 ```bash
 uv tool install git+https://github.com/learningequality/agent-containers
+agent-containers install
 ```
 
-Needs podman or Docker, `git`, and `gh` signed in.
+Needs podman (preferred: it runs rootless) or Docker, `git`, and `gh` signed in.
+
+`install` asks which folders agents may run worktrees from — `~/github` for everything under it, or specific repos or worktrees — then starts a per-user service (a systemd user unit on Linux, a launchd agent on macOS) that serves sandboxed agents in every worktree under them. Change the folders at any time; the service picks them up without a restart:
+
+```bash
+agent-containers roots                        # list
+agent-containers roots add ~/github/studio    # allow another folder
+agent-containers roots remove ~/github        # stop allowing one
+agent-containers uninstall                    # stop and remove the service
+```
 
 ## Usage
 
@@ -34,13 +44,9 @@ agent-containers reap                         # remove instances whose worktree 
 
 ### Sandboxed agents
 
-An agent inside a sandbox (nono, Claude Code's, Codex's) cannot start containers. Start a broker in the worktree outside the sandbox and leave it running:
+An agent inside a sandbox (nono, Claude Code's, Codex's) cannot start containers. It runs the same commands; with no runtime usable, they queue in the worktree's `.agent-containers/` and the service runs them, which needs no change to the sandbox. Unanswered within a few seconds, the command names the fix — `agent-containers install`, or `roots add` for a worktree outside every root — and exits 125.
 
-```bash
-agent-containers broker
-```
-
-Inside the sandbox, the same `run`, `serve`, `stop` and `status` commands then go through the broker. Its repo, runtime, namespace and instance are fixed when it starts, so `--local`, `--repo`, `--runtime`, `--instance`, `--fresh` and `--purge` are refused. Ctrl-C, SIGTERM or SIGHUP on a brokered command kills it in the container. Once a worktree has had a broker, a command there with none answering says so and exits 125; delete `.agent-containers/broker` to run without one.
+The service fixes the repo, runtime and namespace, so `--local`, `--repo`, `--runtime`, `--instance`, `--fresh` and `--purge` are refused there. Ctrl-C, SIGTERM or SIGHUP on a queued command kills it in the container.
 
 ### `serve`
 

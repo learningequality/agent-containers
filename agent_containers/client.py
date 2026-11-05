@@ -20,10 +20,15 @@ from agent_containers.errors import EXIT_TOOL_ERROR
 HEARTBEAT_STALE = 5.0
 POLL_INTERVAL = 0.1
 CANCEL_WAIT = 30.0
-START_HINT = (
-    f"start `agent-containers broker` in this worktree outside your sandbox, or delete {BROKER_DIR} to run without one"
-)
+PICKUP_WAIT = 10.0
 _interrupted = threading.Event()
+
+
+def _unanswered(worktree: Path) -> str:
+    return (
+        f"agent-containers: nothing answered for {worktree}. Outside your sandbox, run `agent-containers install`; "
+        f"if it is installed, add a folder holding this worktree with `agent-containers roots add <folder>`\n"
+    )
 
 
 def broker_alive(worktree: Path) -> bool:
@@ -32,10 +37,6 @@ def broker_alive(worktree: Path) -> bool:
     except OSError:
         return False
     return stat.S_ISREG(info.st_mode) and time.time() - info.st_mtime < HEARTBEAT_STALE
-
-
-def broker_known(worktree: Path) -> bool:
-    return os.path.lexists(worktree / BROKER_DIR / ALIVE)
 
 
 def interrupt_current() -> None:
@@ -53,15 +54,18 @@ def request(
     err: BinaryIO,
 ) -> int:
     _interrupted.clear()
-    if not broker_alive(worktree):
-        err.write(f"agent-containers: no broker answers in {worktree}; {START_HINT}\n".encode())
-        return EXIT_TOOL_ERROR
     broker = worktree / BROKER_DIR
+    (broker / REQUESTS).mkdir(parents=True, exist_ok=True)
+    ignore = broker.parent / ".gitignore"
+    if not os.path.lexists(ignore):
+        ignore.write_text("*\n")
     request_id = uuid.uuid4().hex
     payload = json.dumps({"command": command, "target": target, "argv": argv, "cwd": cwd}).encode()
     temporary = broker / REQUESTS / f".{request_id}.tmp"
+    queued = broker / REQUESTS / f"{request_id}.json"
     temporary.write_bytes(payload)
-    temporary.rename(broker / REQUESTS / f"{request_id}.json")
+    temporary.rename(queued)
+    asked_at = time.monotonic()
     result = broker / RESULTS / request_id
     streams = {"stdout": (out, [None, 0]), "stderr": (err, [None, 0])}
     cancelled_at = None
@@ -78,8 +82,15 @@ def request(
                     cancelled_at = time.monotonic()
                 if cancelled_at is not None and time.monotonic() - cancelled_at > CANCEL_WAIT:
                     return 130
-                if not broker_alive(worktree):
-                    err.write(f"agent-containers: the broker stopped answering; {START_HINT}\n".encode())
+                picked = os.path.lexists(result)
+                if not picked and time.monotonic() - asked_at > PICKUP_WAIT:
+                    with contextlib.suppress(FileNotFoundError):
+                        queued.unlink()
+                    if not os.path.lexists(result):
+                        err.write(_unanswered(worktree).encode())
+                        return EXIT_TOOL_ERROR
+                if picked and not broker_alive(worktree):
+                    err.write(_unanswered(worktree).encode())
                     return EXIT_TOOL_ERROR
                 time.sleep(POLL_INTERVAL)
             except KeyboardInterrupt:
