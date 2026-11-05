@@ -1,0 +1,324 @@
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import posixpath
+import re
+import stat
+import threading
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from agent_containers import images
+from agent_containers.errors import EXIT_TOOL_ERROR
+from agent_containers.errors import ToolError
+from agent_containers.instance import prepare
+from agent_containers.runtime import detect
+from agent_containers.runtime import git_dirs
+
+STATE_DIR = ".agent-containers"
+BROKER = "broker"
+BROKER_DIR = f"{STATE_DIR}/{BROKER}"
+ALIVE = "alive"
+REQUESTS = "requests"
+RESULTS = "results"
+CANCEL = ".cancel"
+REQUEST_LIMIT = 64 * 1024
+COMMANDS = ("run", "serve", "stop", "status")
+FIELDS = {"command", "target", "argv", "cwd"}
+POLL_INTERVAL = 0.2
+EXIT_CANCELLED = 130
+HEARTBEAT_INTERVAL = 1.0
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+class Refused(Exception):
+    pass
+
+
+def _open_dir(parent: int, name: str, *, create: bool) -> int:
+    if create:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(name, 0o755, dir_fd=parent)
+    return os.open(name, _DIR_FLAGS, dir_fd=parent)
+
+
+def _write_new(directory: int, name: str, data: bytes = b"") -> int:
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=directory)
+    if data:
+        os.write(fd, data)
+    return fd
+
+
+def _replace(directory: int, name: str, data: bytes) -> None:
+    temporary = f".{name}.{threading.get_ident()}.tmp"
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(temporary, dir_fd=directory)
+    os.close(_write_new(directory, temporary, data))
+    os.rename(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+
+
+def _read_capped(directory: int, name: str, limit: int) -> bytes:
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Refused(f"{name} is not a regular file")
+        chunks, left = [], limit + 1
+        while left and (chunk := os.read(fd, left)):
+            chunks.append(chunk)
+            left -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > limit:
+            raise Refused(f"request over {limit} bytes")
+        return data
+    finally:
+        os.close(fd)
+
+
+def validate(payload: Any, targets: tuple[str, ...]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise Refused("request is not a JSON object")
+    extra = set(payload) - FIELDS
+    if extra:
+        raise Refused(f"request fields the broker fixes at start: {', '.join(sorted(extra))}")
+    command = payload.get("command")
+    if command not in COMMANDS:
+        raise Refused(f"unknown command {command!r}")
+    argv = payload.get("argv", [])
+    if not isinstance(argv, list) or not all(isinstance(a, str) and "\0" not in a for a in argv):
+        raise Refused("argv must be a list of strings")
+    if command == "run" and not argv:
+        raise Refused("run needs a command")
+    cwd = payload.get("cwd", "")
+    if not isinstance(cwd, str) or "\0" in cwd:
+        raise Refused("cwd must be a string")
+    normal = posixpath.normpath(cwd) if cwd else "."
+    if posixpath.isabs(cwd) or normal == ".." or normal.startswith("../"):
+        raise Refused(f"cwd {cwd!r} leaves the worktree")
+    target = payload.get("target")
+    if target is None and len(targets) == 1:
+        target = targets[0]
+    if target not in targets:
+        raise Refused(f"unknown target {target!r} (declared: {', '.join(targets)})")
+    return {"command": command, "target": target, "argv": argv, "cwd": "" if normal == "." else normal}
+
+
+class Broker:
+    def __init__(
+        self,
+        worktree: Path,
+        repo: str | None,
+        namespace: str,
+        instance_id: str | None,
+        host_ports: dict[str, dict[int, int]] | None = None,
+        *,
+        runtime: str | None = None,
+        factory: Callable[[str], Any] | None = None,
+        targets: tuple[str, ...] | None = None,
+    ):
+        self.worktree = Path(worktree).resolve()
+        self.repo = repo
+        self.namespace = namespace
+        self.instance_id = instance_id
+        self.host_ports = host_ports or {}
+        self.runtime = runtime
+        self._factory = factory
+        self._targets = targets or ()
+        self._instances: dict[str, Any] = {}
+        self._creating: dict[str, threading.Lock] = {}
+        self._running: dict[str, Any] = {}
+        self._cancelled: set[str] = set()
+        self._mutex = threading.Lock()
+        self._closed = threading.Event()
+        self._broker_fd: int | None = None
+
+    def start(self) -> None:
+        if self._factory is None:
+            self._factory, self._targets = self._real_factory()
+        root = os.open(self.worktree, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            state = _open_dir(root, STATE_DIR, create=True)
+        except OSError as exc:
+            raise ToolError(f"{self.worktree / STATE_DIR} is not a directory the broker may use: {exc}") from exc
+        finally:
+            os.close(root)
+        try:
+            _replace(state, ".gitignore", b"*\n")
+            self._broker_fd = _open_dir(state, BROKER, create=True)
+            for name in (REQUESTS, RESULTS):
+                os.close(_open_dir(self._broker_fd, name, create=True))
+        except OSError as exc:
+            raise ToolError(f"{self.worktree / BROKER_DIR} is not a directory the broker may use: {exc}") from exc
+        finally:
+            os.close(state)
+        self._beat()
+        threading.Thread(target=self._heartbeat, name="agent-containers-heartbeat", daemon=True).start()
+
+    def serve_forever(self) -> None:
+        while not self._closed.wait(POLL_INTERVAL):
+            self.poll_once()
+
+    def close(self) -> None:
+        self._closed.set()
+        if self._broker_fd is not None:
+            with contextlib.suppress(OSError):
+                _replace(self._broker_fd, ALIVE, b"stopped\n")
+                os.utime(ALIVE, (0, 0), dir_fd=self._broker_fd, follow_symlinks=False)
+            os.close(self._broker_fd)
+            self._broker_fd = None
+
+    def poll_once(self) -> None:
+        if self._broker_fd is None:
+            return
+        try:
+            requests = _open_dir(self._broker_fd, REQUESTS, create=False)
+        except OSError:
+            return
+        try:
+            for name in sorted(os.listdir(requests)):
+                if name.endswith(CANCEL):
+                    self._cancel(requests, name)
+                elif name.endswith(".json") and _REQUEST_ID.match(name[:-5]):
+                    self._accept(requests, name[:-5])
+        finally:
+            os.close(requests)
+
+    def _cancel(self, requests: int, name: str) -> None:
+        with contextlib.suppress(OSError):
+            os.unlink(name, dir_fd=requests)
+        request_id = name[: -len(CANCEL)]
+        with self._mutex:
+            if request_id not in self._running:
+                return
+            self._cancelled.add(request_id)
+            instance = self._running[request_id]
+        if instance is not None:
+            threading.Thread(target=instance.kill, args=(request_id,), daemon=True).start()
+
+    def _accept(self, requests: int, request_id: str) -> None:
+        try:
+            results = _open_dir(self._broker_fd, RESULTS, create=False)
+        except OSError:
+            return
+        try:
+            os.mkdir(request_id, 0o755, dir_fd=results)
+            result = os.open(request_id, _DIR_FLAGS, dir_fd=results)
+        except OSError:
+            return
+        finally:
+            os.close(results)
+        try:
+            payload = _read_capped(requests, f"{request_id}.json", REQUEST_LIMIT)
+            request = validate(json.loads(payload), self._targets)
+        except (Refused, OSError, ValueError) as exc:
+            self._finish(result, None, None, f"agent-containers broker: refused: {exc}\n", EXIT_TOOL_ERROR)
+            return
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(f"{request_id}.json", dir_fd=requests)
+        with self._mutex:
+            self._running[request_id] = None
+        threading.Thread(target=self._handle, args=(request_id, request, result), daemon=True).start()
+
+    def _handle(self, request_id: str, request: dict[str, Any], result: int) -> None:
+        out = os.fdopen(_write_new(result, "stdout"), "wb", buffering=0)
+        err = os.fdopen(_write_new(result, "stderr"), "wb", buffering=0)
+        code = EXIT_TOOL_ERROR
+        try:
+            instance = self._instance(request["target"])
+            if request["command"] == "run":
+                instance.up()
+                with self._mutex:
+                    cancelled = request_id in self._cancelled
+                    self._running[request_id] = instance
+                if cancelled:
+                    code = EXIT_CANCELLED
+                else:
+                    code = instance.run(request["argv"], cwd=request["cwd"], stdout=out, stderr=err, group=request_id)
+            elif request["command"] == "serve":
+                served = instance.serve()
+                lines = [f"{port} {url}" for port, url in served.urls.items()] + [f"log {served.log}"]
+                out.write(("\n".join(lines) + "\n").encode())
+                code = 0
+            elif request["command"] == "stop":
+                instance.stop()
+                code = 0
+            else:
+                for name, state in instance.status().items():
+                    out.write(f"{state}\t{name}\n".encode())
+                code = 0
+        except ToolError as exc:
+            err.write(f"agent-containers: {exc}\n".encode())
+        except Exception as exc:
+            err.write(f"agent-containers broker: {type(exc).__name__}: {exc}\n".encode())
+        finally:
+            with self._mutex:
+                self._running.pop(request_id, None)
+                self._cancelled.discard(request_id)
+            self._finish(result, out, err, "", code)
+
+    def _finish(self, result: int, out, err, message: str, code: int) -> None:
+        try:
+            if out is None:
+                os.close(_write_new(result, "stdout"))
+            else:
+                out.close()
+            if err is None:
+                os.close(_write_new(result, "stderr", message.encode()))
+            else:
+                err.close()
+            _replace(result, "exit", f"{code}\n".encode())
+        except OSError:
+            pass
+        finally:
+            os.close(result)
+
+    def _instance(self, target: str) -> Any:
+        with self._mutex:
+            creating = self._creating.setdefault(target, threading.Lock())
+        with creating:
+            if target not in self._instances:
+                self._instances[target] = self._factory(target)
+            return self._instances[target]
+
+    def _beat(self) -> None:
+        if self._broker_fd is None:
+            return
+        try:
+            _replace(self._broker_fd, ALIVE, f"{time.time()}\n".encode())
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(ALIVE, dir_fd=self._broker_fd)
+
+    def _heartbeat(self) -> None:
+        while not self._closed.wait(HEARTBEAT_INTERVAL):
+            self._beat()
+
+    def _real_factory(self) -> tuple[Callable[[str], Any], tuple[str, ...]]:
+        runtime = detect(self.runtime)
+        repo = self.repo or images.repo_of(self.worktree)
+        recorded = git_dirs(self.worktree)
+        declaration = images.fetch_declaration(repo)
+        if declaration is None or not declaration.targets:
+            targets: tuple[str, ...] = (images.GENERIC_TARGET,)
+        else:
+            targets = tuple(sorted(declaration.targets))
+
+        def factory(target: str) -> Any:
+            instance = f"{self.instance_id}-{target}" if self.instance_id else None
+            return prepare(
+                self.worktree,
+                target,
+                runtime=runtime,
+                repo=repo,
+                instance=instance,
+                host_ports=self.host_ports.get(target),
+                namespace=self.namespace,
+                git_dirs=recorded,
+            )
+
+        return factory, targets
