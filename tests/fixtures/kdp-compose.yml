@@ -1,0 +1,58 @@
+services:
+  db:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: kdp_postgres
+      POSTGRES_PASSWORD: kdp
+      POSTGRES_DB: portal
+    volumes:
+      - kdp-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kdp_postgres"]
+      interval: 2s
+      retries: 30
+  gcs:
+    image: fsouza/fake-gcs-server:1.55.1
+    command: ["-scheme", "http", "-public-host", "localhost:4443", "-backend", "filesystem", "-filesystem-root", "/data"]
+    ports:
+      - "4443:4443"
+    volumes:
+      - ./.fake-gcs-data:/data
+  web:
+    restart: always
+    build:
+      context: .
+      target: dev
+    command: bash -c "kolibri manage migrate && make generatekey && pnpm run devserver"
+    environment:
+      STORAGE_EMULATOR_HOST: http://gcs:4443
+    ports:
+      - "8000:8000"
+      - "4000-4100:4000-4100"
+    volumes:
+      - ./kolibri_data_portal:/kolibri-data-portal-plugin/kolibri_data_portal
+    depends_on:
+      - db
+      - gcs
+    x-agent:
+      commands:
+        serve: pnpm run devserver
+        test: make test
+        lint: make lint
+        test-jest: pnpm test-jest
+      hosts:
+        - pypi.org
+        - files.pythonhosted.org
+        - registry.npmjs.org
+      ports:
+        "8000": {env: KDP_PORT}
+        "4000-4100": {env: WEBPACK_DEV_PUBLIC_PORT}
+      state: /kolibri
+      ready:
+        path: /portal/
+        port: 8000
+        timeout: 900
+volumes:
+  kdp-postgres:
