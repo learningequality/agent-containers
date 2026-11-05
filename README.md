@@ -98,30 +98,13 @@ Only a 404 for your compose file falls back to `generic`; any other failure to r
 
 The tool never builds from your branch. It reads the `x-agent` declaration from your repo's default branch and pulls `ghcr.io/<owner>/<repo>/<target>:default`, which only your default branch's CI publishes.
 
-Call the reusable workflow once per target:
+Once your `docker-compose.yml` declares its targets, write the workflow that publishes them and commit it:
 
-```yaml
-# .github/workflows/agent-containers.yml
-on:
-  push:
-    branches: [develop]
-  workflow_dispatch:
-jobs:
-  publish:
-    strategy:
-      matrix:
-        target: [web]
-    uses: learningequality/agent-containers/.github/workflows/publish.yml@main
-    with:
-      target: ${{ matrix.target }}
-      paths: "pyproject.toml uv.lock package.json pnpm-lock.yaml"
-      tool-ref: main  # the ref in `uses:` above
-    permissions:
-      contents: read
-      packages: write
+```bash
+agent-containers init
 ```
 
-It publishes only from the default branch, and only when the target's Dockerfile, the compose file or one of `paths` changed in the push; a manual run always publishes.
+It reads the targets from your compose file and asks for the default branch and the files whose change should rebuild the images, offering what it found (lockfiles, `package.json`, `pyproject.toml`, Gradle files). It writes `.github/workflows/agent-containers.yml`, which calls this repo's reusable `publish.yml` once per target. That publishes only from the default branch, and only when a target's Dockerfile, the compose file or one of those files changed in the push; a manual run always publishes. Rerun `init --force` after adding a target.
 
 The declaration is read with `gh`, so its token needs read access to your repo's contents. Pulls authenticate with `gh auth token`, and a private repo's image needs the `read:packages` scope:
 

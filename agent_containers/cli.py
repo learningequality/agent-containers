@@ -10,6 +10,7 @@ from pathlib import Path
 
 from agent_containers import client
 from agent_containers import config
+from agent_containers import init
 from agent_containers import service
 from agent_containers.daemon import Daemon
 from agent_containers.declaration import parse
@@ -104,6 +105,10 @@ def _parser() -> argparse.ArgumentParser:
     roots.add_argument("action", nargs="?", choices=("add", "remove"))
     roots.add_argument("paths", nargs="*")
     commands.add_parser("daemon", help="serve every worktree under the roots (what the service runs)")
+    setup = commands.add_parser("init", help="write the workflow that publishes this repo's targets")
+    setup.add_argument("--branch", help="the default branch; default: the remote's HEAD")
+    setup.add_argument("--paths", help="space-separated files whose change rebuilds the images; default: detected")
+    setup.add_argument("--force", action="store_true", help="replace an existing workflow")
     plan = commands.add_parser("build-plan", help="print how CI builds a target, as JSON")
     plan.add_argument("target")
     plan.add_argument("--compose-file", default=COMPOSE_FILE)
@@ -136,6 +141,8 @@ def _dispatch(args: argparse.Namespace, command: list[str]) -> int:
     if args.command in ("install", "uninstall", "roots", "daemon"):
         return _manage(args)
     worktree, cwd = worktree_and_cwd()
+    if args.command == "init":
+        return _init(args, worktree)
     if args.command in BROKERED and (client.broker_alive(worktree) or not runtime_usable(args.runtime)):
         return _through_broker(args, worktree, cwd, command)
     runtime = detect(args.runtime)
@@ -219,6 +226,21 @@ def _manage(args: argparse.Namespace) -> int:
         roots = config.load_roots()
     for root in roots:
         print(root)
+    return 0
+
+
+def _init(args: argparse.Namespace, worktree: Path) -> int:
+    branch = args.branch or init.default_branch(worktree)
+    paths = args.paths.split() if args.paths is not None else init.dependency_files(worktree)
+    if sys.stdin.isatty():
+        if not args.branch:
+            branch = input(f"Default branch [{branch or ''}]: ").strip() or branch
+        if args.paths is None:
+            answer = input(f"Files whose change rebuilds the images [{' '.join(paths)}]: ").strip()
+            paths = answer.split() if answer else paths
+    if not branch:
+        raise ToolError("cannot tell the default branch; pass --branch")
+    print(f"wrote {init.write(worktree, branch, paths, force=args.force).relative_to(worktree)}")
     return 0
 
 
