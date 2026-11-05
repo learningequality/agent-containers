@@ -4,9 +4,12 @@ import re
 import shlex
 from dataclasses import dataclass
 from dataclasses import field
+from pathlib import Path
 from typing import Any
 
 import yaml
+
+from agent_containers.errors import ToolError
 
 DEVICES = ("kvm",)
 SERVE = "serve"
@@ -128,6 +131,13 @@ class Sidecar:
 class Declaration:
     targets: dict[str, Target] = field(default_factory=dict)
     sidecars: dict[str, Sidecar] = field(default_factory=dict)
+
+
+def load(path: Path) -> Declaration:
+    try:
+        return parse(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ToolError(f"{path}: {exc}") from exc
 
 
 def parse(text: str) -> Declaration:

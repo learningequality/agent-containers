@@ -1,3 +1,4 @@
+import _thread
 import io
 import json
 import subprocess
@@ -131,7 +132,7 @@ def test_interrupting_the_client_kills_the_command(made, tmp_path, monkeypatch):
     out, err = io.BytesIO(), io.BytesIO()
     pump = threading.Thread(target=lambda: [broker.poll_once() or time.sleep(0.05) for _ in range(100)], daemon=True)
     pump.start()
-    interrupted = threading.Timer(0.5, lambda: client.interrupt_current())
+    interrupted = threading.Timer(0.5, _thread.interrupt_main)
     interrupted.start()
 
     code = client.request(tmp_path, "run", "web", ["block"], "", out=out, err=err)

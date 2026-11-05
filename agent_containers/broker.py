@@ -16,15 +16,19 @@ from agent_containers import images
 from agent_containers.errors import EXIT_TOOL_ERROR
 from agent_containers.errors import ToolError
 from agent_containers.instance import prepare
+from agent_containers.instance import served_lines
+from agent_containers.instance import status_lines
+from agent_containers.layout import IGNORE_ALL
+from agent_containers.layout import STATE_DIR
 from agent_containers.runtime import detect
 from agent_containers.runtime import git_dirs
 
-STATE_DIR = ".agent-containers"
 BROKER = "broker"
 BROKER_DIR = f"{STATE_DIR}/{BROKER}"
 ALIVE = "alive"
 REQUESTS = "requests"
 RESULTS = "results"
+REQUEST = "request.json"
 CANCEL = ".cancel"
 REQUEST_LIMIT = 64 * 1024
 COMMANDS = ("run", "serve", "stop", "status")
@@ -107,6 +111,38 @@ def validate(payload: Any, targets: tuple[str, ...]) -> dict[str, Any]:
     return {"command": command, "target": target, "argv": argv, "cwd": "" if normal == "." else normal}
 
 
+def _claim(requests: int, results: int, request_id: str) -> int | None:
+    try:
+        os.mkdir(request_id, 0o755, dir_fd=results)
+        result = os.open(request_id, _DIR_FLAGS, dir_fd=results)
+    except OSError:
+        return None
+    try:
+        os.rename(f"{request_id}.json", REQUEST, src_dir_fd=requests, dst_dir_fd=result)
+    except OSError:
+        os.close(result)
+        with contextlib.suppress(OSError):
+            os.rmdir(request_id, dir_fd=results)
+        return None
+    return result
+
+
+def _refuse(result: int, message: str) -> None:
+    try:
+        os.close(_write_new(result, "stdout"))
+        os.close(_write_new(result, "stderr", message.encode()))
+        _replace(result, "exit", f"{EXIT_TOOL_ERROR}\n".encode())
+    except OSError:
+        pass
+    finally:
+        os.close(result)
+
+
+def _queued(requests: int) -> list[str]:
+    ids = (name[:-5] for name in sorted(os.listdir(requests)) if name.endswith(".json"))
+    return [request_id for request_id in ids if _REQUEST_ID.match(request_id)]
+
+
 def refuse_pending(worktree: Path, message: str) -> None:
     descriptors: list[int] = []
     try:
@@ -118,20 +154,10 @@ def refuse_pending(worktree: Path, message: str) -> None:
         descriptors.append(requests)
         results = _open_dir(broker, RESULTS, create=True)
         descriptors.append(results)
-        for name in os.listdir(requests):
-            request_id = name[:-5]
-            if not name.endswith(".json") or not _REQUEST_ID.match(request_id):
-                continue
-            with contextlib.suppress(OSError):
-                os.unlink(name, dir_fd=requests)
-                os.mkdir(request_id, 0o755, dir_fd=results)
-                result = os.open(request_id, _DIR_FLAGS, dir_fd=results)
-                try:
-                    os.close(_write_new(result, "stdout"))
-                    os.close(_write_new(result, "stderr", f"agent-containers: {message}\n".encode()))
-                    _replace(result, "exit", f"{EXIT_TOOL_ERROR}\n".encode())
-                finally:
-                    os.close(result)
+        for request_id in _queued(requests):
+            result = _claim(requests, results, request_id)
+            if result is not None:
+                _refuse(result, f"agent-containers: {message}\n")
     except OSError:
         return
     finally:
@@ -179,7 +205,7 @@ class Broker:
         finally:
             os.close(root)
         try:
-            _replace(state, ".gitignore", b"*\n")
+            _replace(state, ".gitignore", IGNORE_ALL.encode())
             self._broker_fd = _open_dir(state, BROKER, create=True)
             for name in (REQUESTS, RESULTS):
                 os.close(_open_dir(self._broker_fd, name, create=True))
@@ -214,8 +240,8 @@ class Broker:
             for name in sorted(os.listdir(requests)):
                 if name.endswith(CANCEL):
                     self._cancel(requests, name)
-                elif name.endswith(".json") and _REQUEST_ID.match(name[:-5]):
-                    self._accept(requests, name[:-5])
+            for request_id in _queued(requests):
+                self._accept(requests, request_id)
         finally:
             os.close(requests)
 
@@ -237,21 +263,21 @@ class Broker:
         except OSError:
             return
         try:
-            os.mkdir(request_id, 0o755, dir_fd=results)
-            result = os.open(request_id, _DIR_FLAGS, dir_fd=results)
-        except OSError:
-            return
+            result = _claim(requests, results, request_id)
         finally:
             os.close(results)
+        if result is None:
+            return
         try:
-            payload = _read_capped(requests, f"{request_id}.json", REQUEST_LIMIT)
+            try:
+                payload = _read_capped(result, REQUEST, REQUEST_LIMIT)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(REQUEST, dir_fd=result)
             request = validate(json.loads(payload), self._targets)
         except (Refused, OSError, ValueError) as exc:
-            self._finish(result, None, None, f"agent-containers broker: refused: {exc}\n", EXIT_TOOL_ERROR)
+            _refuse(result, f"agent-containers broker: refused: {exc}\n")
             return
-        finally:
-            with contextlib.suppress(OSError):
-                os.unlink(f"{request_id}.json", dir_fd=requests)
         with self._mutex:
             self._running[request_id] = None
         threading.Thread(target=self._handle, args=(request_id, request, result), daemon=True).start()
@@ -270,18 +296,18 @@ class Broker:
                 if cancelled:
                     code = EXIT_CANCELLED
                 else:
-                    code = instance.run(request["argv"], cwd=request["cwd"], stdout=out, stderr=err, group=request_id)
-            elif request["command"] == "serve":
-                served = instance.serve()
-                lines = [f"{port} {url}" for port, url in served.urls.items()] + [f"log {served.log}"]
-                out.write(("\n".join(lines) + "\n").encode())
-                code = 0
-            elif request["command"] == "stop":
-                instance.stop()
-                code = 0
+                    code = instance.run(
+                        request["argv"], cwd=request["cwd"], stdout=out, stderr=err, group=request_id, ensure=False
+                    )
             else:
-                for name, state in instance.status().items():
-                    out.write(f"{state}\t{name}\n".encode())
+                if request["command"] == "serve":
+                    lines = served_lines(instance.serve())
+                elif request["command"] == "stop":
+                    instance.stop()
+                    lines = []
+                else:
+                    lines = status_lines(instance.status())
+                out.write("".join(f"{line}\n" for line in lines).encode())
                 code = 0
         except ToolError as exc:
             err.write(f"agent-containers: {exc}\n".encode())
@@ -291,23 +317,14 @@ class Broker:
             with self._mutex:
                 self._running.pop(request_id, None)
                 self._cancelled.discard(request_id)
-            self._finish(result, out, err, "", code)
-
-    def _finish(self, result: int, out, err, message: str, code: int) -> None:
-        try:
-            if out is None:
-                os.close(_write_new(result, "stdout"))
-            else:
-                out.close()
-            if err is None:
-                os.close(_write_new(result, "stderr", message.encode()))
-            else:
-                err.close()
-            _replace(result, "exit", f"{code}\n".encode())
-        except OSError:
-            pass
-        finally:
-            os.close(result)
+            out.close()
+            err.close()
+            try:
+                _replace(result, "exit", f"{code}\n".encode())
+            except OSError:
+                pass
+            finally:
+                os.close(result)
 
     def _instance(self, target: str) -> Any:
         with self._mutex:

@@ -9,16 +9,14 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from agent_containers.config import config_home
+from agent_containers.config import home
 from agent_containers.errors import ToolError
 
 UNIT = "agent-containers.service"
 LABEL = "org.learningequality.agent-containers"
 
 Runner = Callable[..., subprocess.CompletedProcess]
-
-
-def _home() -> Path:
-    return Path(os.environ.get("HOME") or Path.home())
 
 
 def _executable() -> str:
@@ -29,12 +27,11 @@ def _executable() -> str:
 
 
 def _unit_path() -> Path:
-    base = os.environ.get("XDG_CONFIG_HOME") or str(_home() / ".config")
-    return Path(base) / "systemd" / "user" / UNIT
+    return config_home() / "systemd" / "user" / UNIT
 
 
 def _plist_path() -> Path:
-    return _home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+    return home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 
 
 def install(run: Runner = subprocess.run) -> str:
@@ -53,7 +50,7 @@ def install(run: Runner = subprocess.run) -> str:
     if sys.platform == "darwin":
         agent = _plist_path()
         agent.parent.mkdir(parents=True, exist_ok=True)
-        log = _home() / "Library" / "Logs" / "agent-containers.log"
+        log = home() / "Library" / "Logs" / "agent-containers.log"
         agent.write_bytes(
             plistlib.dumps(
                 {

@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from fakes import git as _git
 
 from agent_containers import images
 from agent_containers.errors import ToolError
@@ -78,10 +79,6 @@ def _auth_dir(argv):
             path = Path(argv[argv.index(flag) + 1])
             return path if flag == "--config" else path.parent
     return None
-
-
-def _git(cwd, *args):
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
 def test_repo_prefers_upstream_then_origin(tmp_path):

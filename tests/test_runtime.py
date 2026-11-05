@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from fakes import git as _git
 
 from agent_containers import runtime
 from agent_containers.declaration import parse
@@ -155,10 +156,6 @@ def test_reserved_ranges_are_consecutive_and_disjoint():
     finally:
         for sock in sockets:
             sock.close()
-
-
-def _git(cwd, *args):
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
 def _linked_worktree(parent, name):

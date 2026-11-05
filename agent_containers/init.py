@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 from agent_containers import images
-from agent_containers.declaration import Declaration
-from agent_containers.declaration import parse
+from agent_containers.declaration import load
 from agent_containers.errors import ToolError
 from agent_containers.images import COMPOSE_FILE
 
@@ -41,20 +39,14 @@ def default_branch(worktree: Path) -> str | None:
         if answer.returncode == 0 and answer.stdout.strip():
             return answer.stdout.strip()
     for remote in ("upstream", "origin"):
-        result = subprocess.run(
-            ["git", "symbolic-ref", "--short", f"refs/remotes/{remote}/HEAD"],
-            cwd=worktree,
-            capture_output=True,
-            text=True,
-            errors="replace",
-        )
+        result = images._run(["git", "symbolic-ref", "--short", f"refs/remotes/{remote}/HEAD"], cwd=worktree)
         if result.returncode == 0 and result.stdout.strip().startswith(f"{remote}/"):
             return result.stdout.strip()[len(remote) + 1 :]
     return None
 
 
 def dependency_files(worktree: Path) -> list[str]:
-    declaration = _declaration(worktree)
+    declaration = load(worktree / COMPOSE_FILE)
     contexts = [worktree, *((worktree / t.build.context).resolve() for t in declaration.targets.values())]
     found: list[str] = []
     for context in dict.fromkeys(contexts):
@@ -88,7 +80,7 @@ jobs:
 
 
 def write(worktree: Path, branch: str, paths: list[str], *, force: bool = False) -> Path:
-    targets = sorted(_declaration(worktree).targets)
+    targets = sorted(load(worktree / COMPOSE_FILE).targets)
     if not targets:
         raise ToolError(DECLARE_FIRST)
     path = worktree / WORKFLOW
@@ -97,10 +89,3 @@ def write(worktree: Path, branch: str, paths: list[str], *, force: bool = False)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render(branch, targets, paths))
     return path
-
-
-def _declaration(worktree: Path) -> Declaration:
-    try:
-        return parse((worktree / COMPOSE_FILE).read_text())
-    except (OSError, ValueError) as exc:
-        raise ToolError(f"{worktree / COMPOSE_FILE}: {exc}") from exc

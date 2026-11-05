@@ -59,6 +59,9 @@ class Names:
     def prefix(self) -> str:
         return f"ac-{self.namespace}-{self.instance}"
 
+    def labels(self) -> dict[str, str]:
+        return {LABEL_NAMESPACE: self.namespace, LABEL_INSTANCE: self.instance}
+
     @property
     def network(self) -> str:
         return f"{self.prefix}-net"
@@ -93,8 +96,7 @@ class Spec:
 
     def labels(self, role: str) -> dict[str, str]:
         labels = {
-            LABEL_NAMESPACE: self.names.namespace,
-            LABEL_INSTANCE: self.names.instance,
+            **self.names.labels(),
             LABEL_WORKTREE: str(self.worktree),
             LABEL_TARGET: self.target.name,
             LABEL_ROLE: role,
@@ -263,7 +265,7 @@ def qualified(image: str) -> str:
     return f"docker.io/{image}" if slash else f"docker.io/library/{image}"
 
 
-def _flags(flag: str, values: dict[str, str]) -> list[str]:
+def flags(flag: str, values: dict[str, str]) -> list[str]:
     return [item for key, value in values.items() for item in (flag, f"{key}={value}")]
 
 
@@ -342,7 +344,7 @@ class Runtime:
             *no_dns,
             "--subnet",
             subnet,
-            *_flags("--label", spec.labels("network")),
+            *flags("--label", spec.labels("network")),
             spec.names.network,
         ]
 
@@ -356,7 +358,7 @@ class Runtime:
             "create",
             "--name",
             spec.names.gateway,
-            *_flags("--label", spec.labels("gateway")),
+            *flags("--label", spec.labels("gateway")),
             "--network",
             self.default_network,
             *publishes,
@@ -383,7 +385,7 @@ class Runtime:
             "-d",
             "--name",
             spec.names.container(sidecar.name),
-            *_flags("--label", spec.labels("sidecar")),
+            *flags("--label", spec.labels("sidecar")),
             "--network",
             spec.names.network,
             "--ip",
@@ -393,7 +395,7 @@ class Runtime:
             *addresses.host_flags(),
             "--security-opt",
             "no-new-privileges",
-            *_flags("--env", sidecar.environment),
+            *flags("--env", sidecar.environment),
             *[item for v in sidecar.volumes for item in ("--volume", f"{spec.names.volume(v.name)}:{v.path}")],
             *_health_flags(sidecar),
             qualified(sidecar.image),
@@ -416,7 +418,7 @@ class Runtime:
             "-d",
             "--name",
             spec.names.container(target.name),
-            *_flags("--label", spec.labels("target")),
+            *flags("--label", spec.labels("target")),
             "--network",
             spec.names.network,
             "--ip",
@@ -431,7 +433,7 @@ class Runtime:
             *self.user_args(),
             *volumes,
             *devices,
-            *_flags("--env", spec.environment(addresses.gateway)),
+            *flags("--env", spec.environment(addresses.gateway)),
             "--workdir",
             spec.mount,
             spec.image,
@@ -441,15 +443,14 @@ class Runtime:
         ]
 
     def exec_args(
-        self, container: str, argv: list[str], *, workdir: str, env: dict[str, str] | None = None, tty: bool = False
+        self, container: str, argv: list[str], *, workdir: str, tty: bool = False, interactive: bool = True
     ) -> list[str]:
         return [
             "exec",
-            "-i",
+            *(["-i"] if interactive else []),
             *(["-t"] if tty else []),
             "--workdir",
             workdir,
-            *_flags("--env", env or {}),
             container,
             *argv,
         ]
@@ -535,14 +536,19 @@ class Runtime:
             return {}
 
     def remove(self, labels: dict[str, str], *, volumes: bool) -> None:
-        for resource in self.labelled("container", labels):
+        containers = [resource.name for resource in self.labelled("container", labels)]
+        if containers:
             no_wait = ["-t", "0"] if self.name == "podman" else []
-            self.run(["rm", "-f", *no_wait, resource.name], what="remove container", check=False)
-        for resource in self.labelled("network", labels):
-            self.run(["network", "rm", resource.name], what="remove network", check=False)
+            self.run(["rm", "-f", *no_wait, *containers], what="remove containers", check=False)
+        networks = [resource.name for resource in self.labelled("network", labels)]
+        if networks:
+            self.run(["network", "rm", *networks], what="remove networks", check=False)
         if volumes:
-            for resource in self.labelled("volume", labels):
-                self.run(["volume", "rm", "-f", resource.name], what="remove volume", check=False)
+            self.remove_volumes([resource.name for resource in self.labelled("volume", labels)])
+
+    def remove_volumes(self, names: list[str]) -> None:
+        if names:
+            self.run(["volume", "rm", "-f", *names], what="remove volumes", check=False)
 
 
 @dataclass(frozen=True)

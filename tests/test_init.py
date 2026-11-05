@@ -2,6 +2,7 @@ import subprocess
 
 import pytest
 import yaml
+from fakes import git as _git
 
 from agent_containers import cli
 from agent_containers import init
@@ -19,10 +20,6 @@ services:
     build: platforms/android
     x-agent: {}
 """
-
-
-def _git(cwd, *args):
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
 @pytest.fixture

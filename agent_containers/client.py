@@ -4,7 +4,6 @@ import contextlib
 import json
 import os
 import stat
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -16,12 +15,13 @@ from agent_containers.broker import CANCEL
 from agent_containers.broker import REQUESTS
 from agent_containers.broker import RESULTS
 from agent_containers.errors import EXIT_TOOL_ERROR
+from agent_containers.layout import IGNORE_ALL
 
 HEARTBEAT_STALE = 5.0
 POLL_INTERVAL = 0.1
 CANCEL_WAIT = 30.0
 PICKUP_WAIT = 10.0
-_interrupted = threading.Event()
+STREAMS = ("stdout", "stderr")
 
 
 def _unanswered(worktree: Path) -> str:
@@ -39,10 +39,6 @@ def broker_alive(worktree: Path) -> bool:
     return stat.S_ISREG(info.st_mode) and time.time() - info.st_mtime < HEARTBEAT_STALE
 
 
-def interrupt_current() -> None:
-    _interrupted.set()
-
-
 def request(
     worktree: Path,
     command: str,
@@ -53,12 +49,11 @@ def request(
     out: BinaryIO,
     err: BinaryIO,
 ) -> int:
-    _interrupted.clear()
     broker = worktree / BROKER_DIR
     (broker / REQUESTS).mkdir(parents=True, exist_ok=True)
     ignore = broker.parent / ".gitignore"
     if not os.path.lexists(ignore):
-        ignore.write_text("*\n")
+        ignore.write_text(IGNORE_ALL)
     request_id = uuid.uuid4().hex
     payload = json.dumps({"command": command, "target": target, "argv": argv, "cwd": cwd}).encode()
     temporary = broker / REQUESTS / f".{request_id}.tmp"
@@ -67,38 +62,38 @@ def request(
     temporary.rename(queued)
     asked_at = time.monotonic()
     result = broker / RESULTS / request_id
-    streams = {"stdout": (out, [None, 0]), "stderr": (err, [None, 0])}
+    sinks = dict(zip(STREAMS, (out, err), strict=True))
+    fds: dict[str, int] = {}
+    claimed = False
     cancelled_at = None
     try:
         while True:
             try:
                 done = _exit_code(result)
-                _drain(result, streams)
+                _drain(result, sinks, fds)
                 if done is not None:
-                    _drain(result, streams)
                     return done
-                if _interrupted.is_set() and cancelled_at is None:
-                    (broker / REQUESTS / f"{request_id}{CANCEL}").write_bytes(b"")
-                    cancelled_at = time.monotonic()
                 if cancelled_at is not None and time.monotonic() - cancelled_at > CANCEL_WAIT:
                     return 130
-                picked = os.path.lexists(result)
-                if not picked and time.monotonic() - asked_at > PICKUP_WAIT:
-                    with contextlib.suppress(FileNotFoundError):
+                if not claimed and time.monotonic() - asked_at > PICKUP_WAIT:
+                    try:
                         queued.unlink()
-                    if not os.path.lexists(result):
+                    except FileNotFoundError:
+                        claimed = True
+                    else:
                         err.write(_unanswered(worktree).encode())
                         return EXIT_TOOL_ERROR
-                if picked and not broker_alive(worktree):
+                if claimed and not broker_alive(worktree):
                     err.write(_unanswered(worktree).encode())
                     return EXIT_TOOL_ERROR
                 time.sleep(POLL_INTERVAL)
             except KeyboardInterrupt:
-                _interrupted.set()
+                if cancelled_at is None:
+                    (broker / REQUESTS / f"{request_id}{CANCEL}").write_bytes(b"")
+                    cancelled_at = time.monotonic()
     finally:
-        for _, (_, state) in streams.items():
-            if state[0] is not None:
-                os.close(state[0])
+        for fd in fds.values():
+            os.close(fd)
 
 
 def _exit_code(result: Path) -> int | None:
@@ -113,13 +108,13 @@ def _exit_code(result: Path) -> int | None:
     return int(text) if text.lstrip("-").isdigit() else EXIT_TOOL_ERROR
 
 
-def _drain(result: Path, streams: dict[str, tuple[BinaryIO, list]]) -> None:
-    for name, (sink, state) in streams.items():
-        if state[0] is None:
+def _drain(result: Path, sinks: dict[str, BinaryIO], fds: dict[str, int]) -> None:
+    for name, sink in sinks.items():
+        if name not in fds:
             with contextlib.suppress(OSError):
-                state[0] = os.open(result / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        if state[0] is None:
+                fds[name] = os.open(result / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        if name not in fds:
             continue
-        while chunk := os.read(state[0], 65536):
+        while chunk := os.read(fds[name], 65536):
             sink.write(chunk)
         sink.flush()

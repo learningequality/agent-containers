@@ -1,10 +1,10 @@
 import os
-import subprocess
 import uuid
 
 import pytest
 
 from agent_containers import runtime
+from agent_containers.cli import runtime_usable
 
 ENTRYPOINT = """#!/bin/sh
 set -e
@@ -17,12 +17,7 @@ exec "$@"
 
 def usable(name):
     chosen = os.environ.get("AGENT_CONTAINERS_TEST_RUNTIME")
-    if chosen and chosen != name:
-        return False
-    try:
-        return subprocess.run([name, "info"], capture_output=True, timeout=30).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    return (not chosen or chosen == name) and runtime_usable(name)
 
 
 RUNTIMES = [

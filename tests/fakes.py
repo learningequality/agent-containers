@@ -1,7 +1,9 @@
 import os
+import subprocess
 import threading
 
 from agent_containers.instance import Served
+from agent_containers.runtime import Resource
 
 
 class FakeInstance:
@@ -10,7 +12,7 @@ class FakeInstance:
         self.calls = []
         self.killed = threading.Event()
 
-    def run(self, argv, *, cwd="", stdout=None, stderr=None, group=None):
+    def run(self, argv, *, cwd="", stdout=None, stderr=None, group=None, ensure=True):
         self.calls.append(("run", argv, cwd))
         if argv == ["block"]:
             self.killed.wait(10)
@@ -34,4 +36,8 @@ class FakeInstance:
         self.calls.append(("stop", purge))
 
     def status(self):
-        return {"ac-x-web": "target running"}
+        return [Resource("ac-x-web", {"agent-containers.target": "web", "agent-containers.role": "target"}, "running")]
+
+
+def git(cwd, *args):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)

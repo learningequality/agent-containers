@@ -1,3 +1,4 @@
+import _thread
 import io
 import subprocess
 import threading
@@ -63,7 +64,7 @@ def test_interrupting_the_client_kills_the_command_in_the_container(rt, worktree
     made = _broker(rt, worktree, namespace, None)
     try:
         assert _ask(worktree, "run", ["true"])[0] == 0
-        threading.Timer(3, client.interrupt_current).start()
+        threading.Timer(3, _thread.interrupt_main).start()
         started = time.monotonic()
         code, _, _ = _ask(worktree, "run", ["sh", "-c", "sleep 300 & sleep 300"])
         assert time.monotonic() - started < 30

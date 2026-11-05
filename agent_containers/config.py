@@ -7,9 +7,16 @@ from pathlib import Path
 from agent_containers.errors import ToolError
 
 
+def home() -> Path:
+    return Path(os.environ.get("HOME") or Path.home())
+
+
+def config_home() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or home() / ".config")
+
+
 def config_path() -> Path:
-    base = os.environ.get("XDG_CONFIG_HOME") or str(Path(os.environ.get("HOME") or Path.home()) / ".config")
-    return Path(base) / "agent-containers" / "config.json"
+    return config_home() / "agent-containers" / "config.json"
 
 
 def load_roots() -> list[Path]:
@@ -50,9 +57,7 @@ def remove_roots(paths: list[str]) -> list[Path]:
 
 
 def _resolve(path: str) -> Path:
-    home = os.environ.get("HOME") or str(Path.home())
-    expanded = home + path[1:] if path == "~" or path.startswith("~/") else path
-    return Path(expanded).resolve()
+    return Path(os.path.expanduser(path)).resolve()
 
 
 def _save(roots: list[Path]) -> None:

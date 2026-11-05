@@ -12,8 +12,9 @@ from agent_containers import client
 from agent_containers import config
 from agent_containers import init
 from agent_containers import service
+from agent_containers.broker import COMMANDS as BROKERED
 from agent_containers.daemon import Daemon
-from agent_containers.declaration import parse
+from agent_containers.declaration import load
 from agent_containers.errors import EXIT_TOOL_ERROR
 from agent_containers.errors import ToolError
 from agent_containers.images import COMPOSE_FILE
@@ -21,23 +22,20 @@ from agent_containers.images import select
 from agent_containers.instance import Instance
 from agent_containers.instance import prepare
 from agent_containers.instance import reap
+from agent_containers.instance import served_lines
+from agent_containers.instance import status_lines
 from agent_containers.runtime import LABEL_NAMESPACE
-from agent_containers.runtime import LABEL_ROLE
 from agent_containers.runtime import LABEL_TARGET
 from agent_containers.runtime import LABEL_WORKTREE
 from agent_containers.runtime import Runtime
 from agent_containers.runtime import detect
 from agent_containers.runtime import namespace
 
-BROKERED = ("run", "serve", "stop", "status")
 BROKER_FIXED = ("local", "repo", "runtime", "instance", "fresh", "purge")
 
 
 def build_plan(compose_file: Path, target: str, paths: list[str]) -> dict[str, object]:
-    try:
-        declaration = parse(compose_file.read_text())
-    except (OSError, ValueError) as exc:
-        raise ToolError(f"{compose_file}: {exc}") from exc
+    declaration = load(compose_file)
     build = declaration.targets[select(declaration, target, str(compose_file))].build
     context = _relative(compose_file.parent / build.context)
     dockerfile = _relative(compose_file.parent / build.context / build.dockerfile)
@@ -65,7 +63,7 @@ def worktree_and_cwd() -> tuple[Path, str]:
 
 def runtime_usable(name: str | None) -> bool:
     try:
-        return detect(name).run(["info"], what="runtime info", check=False, timeout=30).returncode == 0
+        return detect(name).run(["version"], what="runtime version", check=False, timeout=30).returncode == 0
     except ToolError:
         return False
 
@@ -158,10 +156,7 @@ def _dispatch(args: argparse.Namespace, command: list[str]) -> int:
         instance = _instance(args, worktree, runtime)
         if args.fresh:
             instance.up(fresh=True)
-        served = instance.serve()
-        for port, url in served.urls.items():
-            print(f"{port} {url}")
-        print(f"log {served.log}")
+        print("\n".join(served_lines(instance.serve())))
         return 0
     if args.command == "stop":
         if args.target:
@@ -169,9 +164,8 @@ def _dispatch(args: argparse.Namespace, command: list[str]) -> int:
         runtime.remove(scope, volumes=args.purge)
         return 0
     if args.command == "status":
-        for resource in runtime.labelled("container", scope):
-            labels = resource.labels
-            print(f"{labels.get(LABEL_TARGET, '?')}\t{labels.get(LABEL_ROLE, '?')}\t{resource.state}\t{resource.name}")
+        for line in status_lines(runtime.labelled("container", scope)):
+            print(line)
         return 0
     if args.command == "reap":
         for reaped in reap(runtime, namespace()):

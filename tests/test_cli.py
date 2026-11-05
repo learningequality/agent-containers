@@ -3,16 +3,13 @@ import signal
 import subprocess
 
 import pytest
+from fakes import git as _git
 
 from agent_containers import cli
 from agent_containers import images
 from agent_containers.errors import EXIT_TOOL_ERROR
 from agent_containers.errors import ToolError
 from agent_containers.runtime import Runtime
-
-
-def _git(cwd, *args):
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
 def _failing_gh(argv, *, input=None, cwd=None):

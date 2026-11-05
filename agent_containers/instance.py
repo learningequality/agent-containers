@@ -19,30 +19,36 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_containers import images
+from agent_containers.config import home
 from agent_containers.declaration import SERVE
 from agent_containers.declaration import Build
 from agent_containers.declaration import Declaration
-from agent_containers.declaration import parse
+from agent_containers.declaration import Sidecar
+from agent_containers.declaration import load
 from agent_containers.errors import ToolError
 from agent_containers.images import COMPOSE_FILE
 from agent_containers.images import select
+from agent_containers.layout import IGNORE_ALL
+from agent_containers.layout import STATE_DIR
 from agent_containers.runtime import DEFAULT_WORKDIR
 from agent_containers.runtime import LABEL_INSTANCE
 from agent_containers.runtime import LABEL_NAMESPACE
 from agent_containers.runtime import LABEL_PORTS
 from agent_containers.runtime import LABEL_ROLE
+from agent_containers.runtime import LABEL_TARGET
 from agent_containers.runtime import LABEL_WORKTREE
 from agent_containers.runtime import LOG_TAIL
 from agent_containers.runtime import READY_FILE
 from agent_containers.runtime import Names
+from agent_containers.runtime import Resource
 from agent_containers.runtime import Runtime
 from agent_containers.runtime import Spec
+from agent_containers.runtime import flags
 from agent_containers.runtime import git_mounts
 from agent_containers.runtime import host_networks
 from agent_containers.runtime import namespace as current_namespace
 from agent_containers.runtime import reserve_host_ports
 
-STATE_DIR = ".agent-containers"
 UP_TIMEOUT = 900
 SIDECAR_TIMEOUT = 300
 POLL_INTERVAL = 1.0
@@ -64,6 +70,16 @@ _NO_REDIRECTS = urllib.request.build_opener(_Unredirected, urllib.request.ProxyH
 class Served:
     urls: dict[int, str]
     log: str
+
+
+def served_lines(served: Served) -> list[str]:
+    return [*(f"{port} {url}" for port, url in served.urls.items()), f"log {served.log}"]
+
+
+def status_lines(containers: list[Resource]) -> list[str]:
+    return [
+        f"{c.labels.get(LABEL_TARGET, '?')}\t{c.labels.get(LABEL_ROLE, '?')}\t{c.state}\t{c.name}" for c in containers
+    ]
 
 
 def instance_id(worktree: Path, target: str) -> str:
@@ -123,10 +139,7 @@ def prepare(
     fresh: bool = False,
 ) -> Instance:
     if local:
-        try:
-            declaration = parse((worktree / COMPOSE_FILE).read_text())
-        except (OSError, ValueError) as exc:
-            raise ToolError(f"{worktree / COMPOSE_FILE}: {exc}") from exc
+        declaration = load(worktree / COMPOSE_FILE)
         chosen = select(declaration, target, str(worktree))
         image = f"localhost/agent-containers-local/{_safe(worktree.name)}-{chosen}:latest"
     else:
@@ -160,16 +173,21 @@ def _build_local(runtime: Runtime, worktree: Path, build: Build, image: str) -> 
         raise ToolError(f"building {image} from {context} failed")
 
 
+def _target_container(runtime: Runtime, names: Names) -> Resource | None:
+    found = runtime.labelled("container", {**names.labels(), LABEL_ROLE: "target"})
+    return found[0] if found else None
+
+
+def _ports_of(container: Resource | None) -> dict[int, int]:
+    try:
+        return {int(k): int(v) for k, v in json.loads(container.labels.get(LABEL_PORTS, "{}")).items()}
+    except (AttributeError, ValueError):
+        return {}
+
+
 def _running_ports(runtime: Runtime, names: Names, declared: tuple) -> dict[int, int] | None:
-    labels = {LABEL_NAMESPACE: names.namespace, LABEL_INSTANCE: names.instance, LABEL_ROLE: "target"}
-    for resource in runtime.labelled("container", labels):
-        try:
-            ports = {int(k): int(v) for k, v in json.loads(resource.labels.get(LABEL_PORTS, "{}")).items()}
-        except (ValueError, AttributeError):
-            continue
-        if set(ports) == {port.start for port in declared}:
-            return ports
-    return None
+    ports = _ports_of(_target_container(runtime, names))
+    return ports if ports and set(ports) == {port.start for port in declared} else None
 
 
 def lock_dir() -> Path:
@@ -177,7 +195,7 @@ def lock_dir() -> Path:
     if runtime_dir:
         directory = Path(runtime_dir) / "agent-containers"
     else:
-        directory = Path(os.environ.get("HOME") or Path.home()) / ".cache" / "agent-containers" / "locks"
+        directory = home() / ".cache" / "agent-containers" / "locks"
     directory.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(FileExistsError):
         directory.mkdir(mode=0o700)
@@ -201,7 +219,7 @@ class Instance:
 
     @property
     def labels(self) -> dict[str, str]:
-        return {LABEL_NAMESPACE: self.spec.names.namespace, LABEL_INSTANCE: self.spec.names.instance}
+        return self.spec.names.labels()
 
     @property
     def container(self) -> str:
@@ -211,13 +229,17 @@ class Instance:
     def log(self) -> str:
         return f"{STATE_DIR}/{self.spec.target.name}/serve.log"
 
+    @property
+    def rc(self) -> str:
+        return f"{STATE_DIR}/{self.spec.target.name}/serve.rc"
+
     def up(self, *, fresh: bool = False) -> None:
         with self._lock():
             if not self.spec.ports_given:
                 running = _running_ports(self.runtime, self.spec.names, self.spec.target.ports)
                 if running:
                     self.spec = dataclasses.replace(self.spec, host_ports=running)
-            if not fresh and self._ready():
+            if not fresh and self._reusable():
                 return
             self.runtime.remove(self.labels, volumes=False)
             created = self._ensure_volumes()
@@ -227,13 +249,12 @@ class Instance:
                 for sidecar in self.spec.sidecars:
                     self.runtime.start_sidecar(self.spec, sidecar, addresses)
                 for sidecar in self.spec.sidecars:
-                    self._wait_healthy(self.spec.names.container(sidecar.name))
+                    self._wait_healthy(sidecar)
                 self.runtime.start_target(self.spec, addresses)
                 self._wait_target()
             except BaseException:
                 self.runtime.remove(self.labels, volumes=False)
-                for volume in created:
-                    self.runtime.run(["volume", "rm", "-f", volume], what="remove volume", check=False)
+                self.runtime.remove_volumes(created)
                 raise
 
     def run(
@@ -242,18 +263,20 @@ class Instance:
         *,
         cwd: str = "",
         tty: bool = False,
-        stdin=None,
         stdout=None,
         stderr=None,
         group: str | None = None,
+        ensure: bool = True,
     ) -> int:
-        self.up()
+        if ensure:
+            self.up()
         workdir = f"{self.spec.mount}/{cwd}".rstrip("/") if cwd else self.spec.mount
+        stdin = None
         if group:
             argv = ["setsid", "-w", "sh", "-c", f'echo $$ > {_pidfile(group)}; exec "$@"', "sh", *argv]
-            stdin = stdin or subprocess.DEVNULL
+            stdin = subprocess.DEVNULL
         args = self.runtime.exec_args(self.container, argv, workdir=workdir, tty=tty)
-        return _passthrough([self.runtime.name, *args], stdin=stdin, stdout=stdout, stderr=stderr)
+        return subprocess.run([self.runtime.name, *args], stdin=stdin, stdout=stdout, stderr=stderr).returncode
 
     def kill(self, group: str) -> None:
         pidfile = _pidfile(group)
@@ -274,9 +297,11 @@ class Instance:
             if self._probe()[0]:
                 return served
             mount = shlex.quote(self.spec.mount)
-            log, rc = f"{mount}/{self.log}", f"{mount}/{self.log[:-4]}.rc"
+            log, rc = f"{mount}/{self.log}", f"{mount}/{self.rc}"
+            ignore = shlex.quote(IGNORE_ALL)
             script = (
-                f"cd {mount} && mkdir -p {STATE_DIR}/{self.spec.target.name} && printf '*\\n' > {STATE_DIR}/.gitignore"
+                f"cd {mount} && mkdir -p {STATE_DIR}/{self.spec.target.name}"
+                f" && printf %s {ignore} > {STATE_DIR}/.gitignore"
                 f" && rm -f {log} {rc} && ( {self.spec.target.commands[SERVE]}\n) > {log} 2>&1; echo $? > {rc}"
             )
             self.runtime.run(["exec", "-d", self.container, "sh", "-c", script], what="start serve")
@@ -290,18 +315,19 @@ class Instance:
         with self._lock():
             self.runtime.remove(self.labels, volumes=purge)
 
-    def status(self) -> dict[str, str]:
-        rows = self.runtime.labelled("container", self.labels)
-        return {r.name: f"{r.labels.get(LABEL_ROLE, '?')} {r.state}" for r in rows}
+    def status(self) -> list[Resource]:
+        return self.runtime.labelled("container", self.labels)
 
-    def _ready(self) -> bool:
-        if not self.runtime.running(self.container):
-            return False
-        current = self.runtime.labelled("container", {**self.labels, LABEL_ROLE: "target"})
-        if not current or current[0].labels.get(LABEL_PORTS) != self.spec.labels("target")[LABEL_PORTS]:
-            return False
-        probe = self.runtime.run(["exec", self.container, "test", "-f", READY_FILE], what="probe", check=False)
-        return probe.returncode == 0
+    def _reusable(self) -> bool:
+        current = _target_container(self.runtime, self.spec.names)
+        return current is not None and current.state == "running" and _ports_of(current) == self.spec.host_ports
+
+    def _started(self) -> bool:
+        return self._exec(["test", "-f", READY_FILE], what="probe").returncode == 0
+
+    def _exec(self, argv: list[str], *, what: str, **kwargs) -> subprocess.CompletedProcess[str]:
+        exec_args = self.runtime.exec_args(self.container, argv, workdir=self.spec.mount, interactive="input" in kwargs)
+        return self.runtime.run(exec_args, what=what, check=False, **kwargs)
 
     def _ensure_volumes(self) -> list[str]:
         wanted = {volume.name for sidecar in self.spec.sidecars for volume in sidecar.volumes}
@@ -309,19 +335,23 @@ class Instance:
         names = [self.spec.names.volume(name) for name in sorted(wanted)]
         if self.spec.target.state:
             names.append(self.spec.names.state)
+        existing = {volume.name for volume in self.runtime.labelled("volume", self.labels)}
+        labels = flags("--label", self.spec.labels("volume"))
         created = []
         for name in names:
-            if self.runtime.exists("volume", name):
+            if name in existing:
                 continue
-            labels = [item for k, v in self.spec.labels("volume").items() for item in ("--label", f"{k}={v}")]
-            self.runtime.run(["volume", "create", *labels, name], what="create volume")
-            created.append(name)
+            made = self.runtime.run(["volume", "create", *labels, name], what="create volume", check=False)
+            if made.returncode == 0:
+                created.append(name)
+            elif not self.runtime.exists("volume", name):
+                raise ToolError(f"create volume {name} failed: {made.stderr.strip()[-LOG_TAIL:]}")
         return created
 
-    def _wait_healthy(self, container: str) -> None:
-        sidecar = next(s for s in self.spec.sidecars if self.spec.names.container(s.name) == container)
+    def _wait_healthy(self, sidecar: Sidecar) -> None:
         if sidecar.healthcheck is None:
             return
+        container = self.spec.names.container(sidecar.name)
         deadline = time.monotonic() + SIDECAR_TIMEOUT
         while time.monotonic() < deadline:
             if not self.runtime.running(container):
@@ -339,7 +369,7 @@ class Instance:
         timeout = self.spec.target.ready.timeout if self.spec.target.ready else UP_TIMEOUT
         deadline = time.monotonic() + max(timeout, UP_TIMEOUT)
         while time.monotonic() < deadline:
-            if self._ready():
+            if self._started():
                 return
             if not self.runtime.running(self.container):
                 logs = self.runtime.logs(self.container)[-LOG_TAIL:]
@@ -353,7 +383,7 @@ class Instance:
         deadline = time.monotonic() + ready.timeout
         outcome = "no probe ran"
         while time.monotonic() < deadline:
-            rc = self._read(f"{self.log[:-4]}.rc").strip()
+            rc = self._exec(["sh", "-c", f"cat {self.rc} 2>/dev/null"], what="read").stdout.strip()
             if rc:
                 raise ToolError(f"{SERVE} exited early (rc={rc}):\n{self._tail()}")
             ok, outcome = self._probe()
@@ -368,12 +398,7 @@ class Instance:
         ready = self.spec.target.ready
         assert ready is not None
         if ready.command:
-            result = self.runtime.run(
-                ["exec", "--workdir", self.spec.mount, self.container, "sh", "-c", ready.command],
-                what="ready command",
-                check=False,
-                timeout=60,
-            )
+            result = self._exec(["sh", "-c", ready.command], what="ready command", timeout=60)
             return result.returncode == 0, f"ready command exited {result.returncode}"
         try:
             with _NO_REDIRECTS.open(probe_url(self.spec), timeout=5) as response:
@@ -390,30 +415,13 @@ class Instance:
         except urllib.error.HTTPError as exc:
             with exc:
                 body = exc.read(ERROR_BODY_LIMIT).decode(errors="replace")
-            self.runtime.run(
-                ["exec", "-i", "--workdir", self.spec.mount, self.container, "sh", "-c", f"cat >> {self.log}"],
-                what="keep error body",
-                input=f"\n--- HTTP {exc.code} body ---\n{body}\n",
-                check=False,
-            )
+            body = f"\n--- HTTP {exc.code} body ---\n{body}\n"
+            self._exec(["sh", "-c", f"cat >> {self.log}"], what="keep error body", input=body)
         except OSError:
             pass
 
-    def _read(self, relative: str) -> str:
-        result = self.runtime.run(
-            ["exec", "--workdir", self.spec.mount, self.container, "sh", "-c", f"cat {relative} 2>/dev/null"],
-            what="read",
-            check=False,
-        )
-        return result.stdout
-
     def _tail(self) -> str:
-        result = self.runtime.run(
-            ["exec", "--workdir", self.spec.mount, self.container, "tail", "-c", str(LOG_TAIL), self.log],
-            what="read serve log",
-            check=False,
-        )
-        return result.stdout
+        return self._exec(["tail", "-c", str(LOG_TAIL), self.log], what="read serve log").stdout
 
     @contextlib.contextmanager
     def _lock(self, purpose: str = "up") -> Iterator[None]:
@@ -430,17 +438,13 @@ def _pidfile(group: str) -> str:
     return f"/tmp/.agent-containers-{_safe(group)}.pid"
 
 
-def _passthrough(argv: list[str], *, stdin=None, stdout=None, stderr=None) -> int:
-    return subprocess.run(argv, stdin=stdin, stdout=stdout, stderr=stderr).returncode
-
-
 def reap(runtime: Runtime, ns: str) -> list[str]:
-    reaped: dict[str, str] = {}
+    reaped: set[str] = set()
     for kind in ("container", "volume", "network"):
         for resource in runtime.labelled(kind, {LABEL_NAMESPACE: ns}):
             worktree = resource.labels.get(LABEL_WORKTREE)
             if worktree and resource.labels.get(LABEL_INSTANCE) and not Path(worktree).exists():
-                reaped[resource.labels[LABEL_INSTANCE]] = worktree
+                reaped.add(resource.labels[LABEL_INSTANCE])
     for instance in reaped:
-        runtime.remove({LABEL_NAMESPACE: ns, LABEL_INSTANCE: instance}, volumes=True)
+        runtime.remove(Names(ns, instance).labels(), volumes=True)
     return sorted(reaped)
