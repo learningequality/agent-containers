@@ -1,0 +1,16 @@
+name: Publish the generic target
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  generic:
+    uses: ./.github/workflows/publish.yml
+    with:
+      target: generic
+      tool-ref: ${{ github.sha }}
+    permissions:
+      contents: read
+      packages: write
