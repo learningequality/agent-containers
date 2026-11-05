@@ -1,0 +1,36 @@
+[project]
+name = "agent-containers"
+version = "0.1.0"
+description = "Run commands in a repo-defined container per target, for humans and sandboxed agents alike"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["pyyaml>=6"]
+
+[project.scripts]
+agent-containers = "agent_containers.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_containers"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: needs a real container runtime (podman or docker)"]
+addopts = "-m 'not live'"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.ruff.lint.isort]
+force-single-line = true

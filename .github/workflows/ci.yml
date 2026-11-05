@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv run --group dev ruff check .
+      - run: uv run --group dev ruff format --check .
+      - run: uv run --group dev pytest
+
+  live:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [podman, docker]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Check the runtime answers
+        run: ${{ matrix.runtime }} info
+      - name: Live tests
+        env:
+          AGENT_CONTAINERS_TEST_RUNTIME: ${{ matrix.runtime }}
+        run: uv run --group dev pytest -m live tests/live
