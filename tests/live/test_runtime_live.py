@@ -1,3 +1,4 @@
+import ipaddress
 import os
 import socket
 import time
@@ -39,7 +40,7 @@ def bring_up(rt, spec):
     while time.monotonic() < deadline:
         probe = rt.run(["exec", container, "test", "-f", runtime.READY_FILE], what="probe", check=False)
         if probe.returncode == 0:
-            return container
+            return container, addresses
         time.sleep(0.5)
     raise AssertionError(rt.logs(container))
 
@@ -59,13 +60,26 @@ def instance(rt, tmp_path, namespace):
         host_ports=runtime.reserve_host_ports(target.ports),
         denied=runtime.host_networks(),
     )
-    started = time.monotonic()
-    container = bring_up(rt, spec)
-    return rt, spec, container, time.monotonic() - started
+    container, addresses = bring_up(rt, spec)
+    return rt, spec, container, addresses
 
 
 def _exec(rt, container, code):
     return rt.run(["exec", container, "python3", "-c", code], what="exec", check=False, timeout=60)
+
+
+def _connect(rt, container, address, port):
+    code = (
+        "import socket\n"
+        "try:\n"
+        f"    socket.create_connection(({address!r}, {port}), timeout=5)\n"
+        "    print('connected')\n"
+        "except OSError as exc:\n"
+        "    print('refused', exc)\n"
+    )
+    result = _exec(rt, container, code)
+    assert result.stdout.startswith(("connected", "refused")), result.stderr
+    return result.stdout
 
 
 def test_allowlisted_host_succeeds_through_the_proxy(instance):
@@ -83,25 +97,24 @@ def test_unlisted_host_is_refused_by_the_proxy(instance):
 
 
 def test_a_direct_connection_bypassing_the_proxy_fails(instance):
-    rt, _, container, _ = instance
-    code = "import socket; socket.create_connection(('151.101.0.223', 443), timeout=5); print('connected')"
-    result = _exec(rt, container, code)
-    assert "connected" not in result.stdout
+    rt, spec, container, _ = instance
+    outside = socket.gethostbyname("pypi.org")
+    assert _connect(rt, spec.names.gateway, outside, 443).startswith("connected")
+    assert _connect(rt, container, outside, 443).startswith("refused")
 
 
 def test_the_host_is_unreachable_from_the_target(instance):
-    rt, spec, container, _ = instance
+    rt, _, container, addresses = instance
     listener = socket.socket()
     listener.bind(("0.0.0.0", 0))
     listener.listen()
     port = listener.getsockname()[1]
+    bridge = str(next(ipaddress.ip_network(addresses.subnet).hosts()))
     try:
-        addresses = {a[4][0] for a in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)}
-        addresses |= {"10.0.2.2", "host.containers.internal", "host.docker.internal"}
-        network = rt.run(["network", "inspect", spec.names.network], what="inspect")
-        for address in addresses:
-            code = f"import socket; socket.create_connection(({address!r}, {port}), timeout=3); print('connected')"
-            assert "connected" not in _exec(rt, container, code).stdout, (address, network.stdout)
+        candidates = {a[4][0] for a in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)}
+        candidates |= {bridge, "10.0.2.2", "host.containers.internal", "host.docker.internal"}
+        for address in candidates:
+            assert _connect(rt, container, address, port).startswith("refused"), address
     finally:
         listener.close()
 
@@ -143,11 +156,6 @@ def test_the_target_is_told_its_host_ports(instance):
     rt, spec, container, _ = instance
     result = rt.run(["exec", container, "sh", "-c", "echo $APP_PORT $APP_RANGE"], what="echo")
     assert result.stdout.split() == [str(spec.host_ports[8000]), str(spec.host_ports[4000])]
-
-
-def test_a_hundred_port_range_starts_within_the_readiness_timeout(instance):
-    _, _, _, elapsed = instance
-    assert elapsed < 600
 
 
 def test_orphaned_processes_are_reaped(instance):

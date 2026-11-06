@@ -14,6 +14,8 @@ from agent_containers.errors import ToolError
 DEVICES = ("kvm",)
 SERVE = "serve"
 PROXY_PORT = 3128
+X_AGENT_KEYS = frozenset({"commands", "hosts", "ports", "state", "ready", "devices"})
+READY_KEYS = frozenset({"timeout", "path", "port", "command"})
 
 _HOST_LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -57,6 +59,10 @@ class Ready:
     command: str = ""
 
     def __post_init__(self) -> None:
+        for name, kind in (("timeout", int), ("port", int), ("path", str), ("command", str)):
+            value = getattr(self, name)
+            if not isinstance(value, kind) or isinstance(value, bool):
+                raise ValueError(f"ready's {name} must be {'a number' if kind is int else 'text'}, not {value!r}")
         probe = bool(self.path or self.port)
         if probe == bool(self.command):
             raise ValueError("ready needs either path and port, or command")
@@ -141,20 +147,21 @@ def load(path: Path) -> Declaration:
 
 
 def parse(text: str) -> Declaration:
-    document = _interpolate(yaml.safe_load(text) or {})
-    if not isinstance(document, dict):
-        raise ValueError("the compose file is not a mapping")
-    services = document.get("services") or {}
-    if not isinstance(services, dict):
-        raise ValueError("services is not a mapping")
-    named = set((document.get("volumes") or {}).keys())
+    try:
+        return _parse(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"malformed compose file: {exc}") from exc
+
+
+def _parse(text: str) -> Declaration:
+    document = _mapping("the compose file", _interpolate(yaml.safe_load(text)))
+    services = _mapping("services", document.get("services"))
+    named = set(_mapping("volumes", document.get("volumes")))
     targets: dict[str, Target] = {}
     sidecars: dict[str, Sidecar] = {}
     unrunnable: list[str] = []
     for name, service in services.items():
-        service = service or {}
-        if not isinstance(service, dict):
-            raise ValueError(f"service {name!r} is not a mapping")
+        service = _mapping(f"service {name!r}", service)
         if "x-agent" in service:
             targets[name] = _target(name, service, named)
         elif service.get("image"):
@@ -168,36 +175,65 @@ def parse(text: str) -> Declaration:
 
 
 def _target(name: str, service: dict[str, Any], named: set[str]) -> Target:
-    agent = service["x-agent"] or {}
-    if not isinstance(agent, dict):
-        raise ValueError(f"target {name!r}: x-agent is not a mapping")
+    where = f"target {name!r}"
+    agent = _mapping(f"{where}: x-agent", service["x-agent"])
     if "build" not in service:
-        raise ValueError(f"target {name!r} has no build: the tool builds every target's image")
+        raise ValueError(f"{where} has no build: the tool builds every target's image")
+    _known_keys(f"{where}: x-agent", agent, X_AGENT_KEYS)
     ready = agent.get("ready")
+    if ready is not None:
+        _known_keys(f"{where}: ready", ready, READY_KEYS)
     return Target(
         name=name,
         build=_build(service["build"]),
-        environment=_environment(service.get("environment")),
+        environment=_environment(f"{where}: environment", service.get("environment")),
         working_dir=str(service.get("working_dir") or ""),
-        volumes=_volumes(service.get("volumes"), named),
-        commands={str(k): str(v) for k, v in (agent.get("commands") or {}).items()},
-        hosts=tuple(str(h) for h in agent.get("hosts") or ()),
-        ports=tuple(_port(str(k), v) for k, v in (agent.get("ports") or {}).items()),
+        volumes=_volumes(f"{where}: volumes", service.get("volumes"), named),
+        commands={str(k): str(v) for k, v in _mapping(f"{where}: commands", agent.get("commands")).items()},
+        hosts=tuple(str(h) for h in _sequence(f"{where}: hosts", agent.get("hosts"))),
+        ports=tuple(_port(str(k), v) for k, v in _mapping(f"{where}: ports", agent.get("ports")).items()),
         state=str(agent.get("state") or ""),
         ready=Ready(**{k: ready[k] for k in ("timeout", "path", "port", "command") if k in ready}) if ready else None,
-        devices=tuple(str(d) for d in agent.get("devices") or ()),
+        devices=tuple(str(d) for d in _sequence(f"{where}: devices", agent.get("devices"))),
     )
 
 
+def _mapping(where: str, value: Any) -> dict[Any, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} is not a mapping")
+    return value
+
+
+def _sequence(where: str, value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{where} is not a list")
+    return value
+
+
+def _known_keys(where: str, value: Any, known: frozenset[str]) -> None:
+    unknown = sorted(set(map(str, _mapping(where, value))) - known)
+    if unknown:
+        raise ValueError(f"{where} has unknown keys {', '.join(unknown)} (known: {', '.join(sorted(known))})")
+
+
 def _sidecar(name: str, service: dict[str, Any], named: set[str]) -> Sidecar:
-    command = service.get("command") or ()
+    where = f"service {name!r}"
+    command = service.get("command")
     return Sidecar(
         name=name,
         image=str(service.get("image") or ""),
-        environment=_environment(service.get("environment")),
-        command=tuple(shlex.split(command)) if isinstance(command, str) else tuple(str(c) for c in command),
-        healthcheck=_healthcheck(service.get("healthcheck")),
-        volumes=_volumes(service.get("volumes"), named),
+        environment=_environment(f"{where}: environment", service.get("environment")),
+        command=(
+            tuple(shlex.split(command))
+            if isinstance(command, str)
+            else tuple(str(c) for c in _sequence(f"{where}: command", command))
+        ),
+        healthcheck=_healthcheck(f"{where}: healthcheck", service.get("healthcheck")),
+        volumes=_volumes(f"{where}: volumes", service.get("volumes"), named),
     )
 
 
@@ -213,18 +249,16 @@ def _build(value: Any) -> Build:
     )
 
 
-def _environment(value: Any) -> dict[str, str]:
-    if not value:
-        return {}
+def _environment(where: str, value: Any) -> dict[str, str]:
     if isinstance(value, dict):
         return {str(k): "" if v is None else str(v) for k, v in value.items()}
-    pairs = (str(item).partition("=") for item in value)
+    pairs = (str(item).partition("=") for item in _sequence(where, value))
     return {key: val for key, _, val in pairs}
 
 
-def _volumes(value: Any, named: set[str]) -> tuple[Volume, ...]:
+def _volumes(where: str, value: Any, named: set[str]) -> tuple[Volume, ...]:
     kept = []
-    for entry in value or ():
+    for entry in _sequence(where, value):
         if isinstance(entry, dict):
             if entry.get("type", "volume") != "volume":
                 continue
@@ -237,15 +271,19 @@ def _volumes(value: Any, named: set[str]) -> tuple[Volume, ...]:
     return tuple(kept)
 
 
-def _healthcheck(value: Any) -> Healthcheck | None:
+def _healthcheck(where: str, value: Any) -> Healthcheck | None:
+    value = _mapping(where, value)
     if not value or value.get("disable"):
         return None
     test = value.get("test")
+    retries = value.get("retries") or 0
+    if not isinstance(retries, (int, str)) or isinstance(retries, bool) or not str(retries).isdigit():
+        raise ValueError(f"{where}: retries must be a number, not {retries!r}")
     return Healthcheck(
-        test=(test,) if isinstance(test, str) else tuple(str(t) for t in test),
+        test=(test,) if isinstance(test, str) else tuple(str(t) for t in _sequence(f"{where}: test", test)),
         interval=str(value.get("interval") or ""),
         timeout=str(value.get("timeout") or ""),
-        retries=int(value.get("retries") or 0),
+        retries=int(retries),
         start_period=str(value.get("start_period") or ""),
     )
 

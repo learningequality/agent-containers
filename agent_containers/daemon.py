@@ -90,7 +90,7 @@ class Daemon:
             made = self._broker_factory(worktree)
             try:
                 made.start()
-            except ToolError as exc:
+            except (ToolError, OSError) as exc:
                 self._failed[worktree] = (time.monotonic(), str(exc))
                 refuse_pending(worktree, str(exc))
                 continue

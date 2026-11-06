@@ -301,12 +301,14 @@ class Instance:
                 return served
             mount = shlex.quote(self.spec.mount)
             log, rc = f"{mount}/{self.log}", f"{mount}/{self.rc}"
-            ignore = shlex.quote(IGNORE_ALL)
-            script = (
-                f"cd {mount} && mkdir -p {STATE_DIR}/{self.spec.target.name}"
-                f" && printf %s {ignore} > {STATE_DIR}/.gitignore"
-                f" && rm -f {log} {rc} && ( {self.spec.target.commands[SERVE]}\n) > {log} 2>&1; echo $? > {rc}"
+            prepare = (
+                f"mkdir -p {STATE_DIR}/{self.spec.target.name}"
+                f" && printf %s {shlex.quote(IGNORE_ALL)} > {STATE_DIR}/.gitignore && rm -f {log} {rc}"
             )
+            cleared = self._exec(["sh", "-c", prepare], what="prepare serve")
+            if cleared.returncode != 0:
+                raise ToolError(f"cannot prepare {self.log}: {cleared.stderr.strip()[-LOG_TAIL:]}")
+            script = f"cd {mount} && ( {self.spec.target.commands[SERVE]}\n) > {log} 2>&1; echo $? > {rc}"
             self.runtime.run(["exec", "-d", self.container, "sh", "-c", script], what="start serve")
             self._wait_served()
         return served
@@ -407,7 +409,10 @@ class Instance:
         ready = self.spec.target.ready
         assert ready is not None
         if ready.command:
-            result = self._exec(["sh", "-c", ready.command], what="ready command", timeout=60)
+            try:
+                result = self._exec(["sh", "-c", ready.command], what="ready command", timeout=60)
+            except ToolError as exc:
+                return False, str(exc)
             return result.returncode == 0, f"ready command exited {result.returncode}"
         try:
             with _NO_REDIRECTS.open(probe_url(self.spec), timeout=5) as response:
@@ -451,9 +456,10 @@ def reap(runtime: Runtime, ns: str) -> list[str]:
     reaped: set[str] = set()
     for kind in ("container", "volume", "network"):
         for resource in runtime.labelled(kind, {LABEL_NAMESPACE: ns}):
-            worktree = resource.labels.get(LABEL_WORKTREE)
-            if worktree and resource.labels.get(LABEL_INSTANCE) and not Path(worktree).exists():
+            worktree = Path(resource.labels.get(LABEL_WORKTREE) or "")
+            deleted = worktree.is_absolute() and not worktree.exists() and worktree.parent.is_dir()
+            if deleted and resource.labels.get(LABEL_INSTANCE):
                 reaped.add(resource.labels[LABEL_INSTANCE])
-    for instance in reaped:
+    for instance in sorted(reaped):
         runtime.remove(Names(ns, instance).labels(), volumes=True)
     return sorted(reaped)

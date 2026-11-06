@@ -1,6 +1,5 @@
 import ipaddress
 import os
-import socket
 import subprocess
 from pathlib import Path
 
@@ -145,18 +144,23 @@ def test_target_environment_carries_host_ports_and_the_proxy(tmp_path):
     assert env["STORAGE_EMULATOR_HOST"] == "http://gcs:4443"
 
 
-def test_reserved_ranges_are_consecutive_and_disjoint():
+def test_reserved_ranges_do_not_overlap():
     ports = parse((FIXTURES / "kdp-compose.yml").read_text()).targets["web"].ports
     reserved = runtime.reserve_host_ports(ports)
-    single, block = reserved[8000], reserved[4000]
-    assert single not in range(block, block + 101)
-    sockets = [socket.socket() for _ in range(101)]
+    spans = sorted((reserved[port.start], reserved[port.start] + port.count - 1) for port in ports)
+    assert all(earlier[1] < later[0] for earlier, later in zip(spans, spans[1:], strict=False))
+
+
+def test_a_bound_block_is_consecutive():
+    block = []
+    while not block:
+        block = runtime._bind_block(5)
     try:
-        for offset, sock in enumerate(sockets):
-            sock.bind(("127.0.0.1", block + offset))
+        ports = [sock.getsockname()[1] for sock in block]
     finally:
-        for sock in sockets:
+        for sock in block:
             sock.close()
+    assert ports == list(range(ports[0], ports[0] + 5))
 
 
 def _linked_worktree(parent, name):
@@ -277,6 +281,45 @@ def test_short_sidecar_images_mean_docker_hub_as_compose_does(tmp_path, image, q
     assert qualified in argv
 
 
+def test_the_internal_subnet_never_overlaps_a_host_network(tmp_path, monkeypatch):
+    spec = _spec(tmp_path, denied=(ipaddress.ip_network("10.200.0.0/16"),))
+    picks = iter([(200 - 128) * 256 + 7, (201 - 128) * 256 + 7])
+    monkeypatch.setattr(runtime.random, "randrange", lambda stop: next(picks))
+    rt = runtime.Runtime("podman")
+    recorded = _Recorded()
+    monkeypatch.setattr(rt, "run", recorded)
+
+    addresses = rt.create_network(spec)
+
+    assert addresses.subnet == "10.201.7.0/24"
+    assert [call for call in recorded.calls if "10.200.7.0/24" in call] == []
+
+
+@pytest.mark.parametrize(
+    ("denied", "pool"),
+    [(("10.0.0.0/8",), "172.16.0.0/12"), (("10.0.0.0/8", "172.16.0.0/12"), "192.168.0.0/16")],
+)
+def test_a_vpn_route_over_a_whole_pool_moves_the_subnet_to_the_next(tmp_path, monkeypatch, denied, pool):
+    spec = _spec(tmp_path, denied=tuple(ipaddress.ip_network(d) for d in denied))
+    rt = runtime.Runtime("podman")
+    monkeypatch.setattr(rt, "run", _Recorded())
+
+    addresses = rt.create_network(spec)
+
+    assert ipaddress.ip_network(addresses.subnet).subnet_of(ipaddress.ip_network(pool))
+
+
+def test_no_free_pool_fails_without_creating_a_network(tmp_path, monkeypatch):
+    denied = tuple(ipaddress.ip_network(d) for d in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+    rt = runtime.Runtime("podman")
+    recorded = _Recorded()
+    monkeypatch.setattr(rt, "run", recorded)
+
+    with pytest.raises(runtime.ToolError, match="10.0.0.0/8"):
+        rt.create_network(_spec(tmp_path, denied=denied))
+    assert recorded.calls == []
+
+
 @pytest.mark.parametrize(
     ("name", "rootless", "claims"), [("docker", False, True), ("docker", True, False), ("podman", False, False)]
 )
@@ -322,6 +365,19 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
     networks = {runtime._site(ipaddress.ip_interface(a).network) for a in addresses}
     assert ipaddress.ip_network("192.168.1.0/24") in networks
     assert ipaddress.ip_network("127.0.0.0/8") in networks
+
+
+def test_private_routes_become_networks_but_default_and_public_routes_do_not():
+    routes = [
+        {"dst": "default", "gateway": "192.168.1.1", "dev": "wlan0"},
+        {"dst": "0.0.0.0/1", "dev": "tun0"},
+        {"dst": "128.0.0.0/1", "dev": "tun0"},
+        {"dst": "10.0.0.0/8", "dev": "tun0"},
+        {"dst": "172.16.4.7", "dev": "wg0"},
+        {"dst": "192.168.1.0/24", "dev": "wlan0", "scope": "link"},
+    ]
+
+    assert runtime._routed_networks(routes) == ["10.0.0.0/8", "172.16.4.7", "192.168.1.0/24"]
 
 
 def test_global_ipv6_networks_widen_to_the_site():

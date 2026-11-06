@@ -30,7 +30,7 @@ agent-containers run web -- pnpm test-jest    # a named target
 agent-containers serve web                    # start `serve`, print its URLs and log path
 agent-containers status                       # this worktree's containers
 agent-containers stop [web] [--purge]         # stop; --purge also drops volumes
-agent-containers reap                         # remove instances whose worktree is gone
+agent-containers reap                         # remove instances whose worktree was deleted (its parent folder remains)
 ```
 
 - `run` exits with the command's exit code; a failure of the tool itself exits 125.
@@ -104,7 +104,7 @@ Once your `docker-compose.yml` declares its targets, write the workflow that pub
 agent-containers init
 ```
 
-It reads the targets from your compose file and asks for the default branch and the files whose change should rebuild the images, offering what it found (lockfiles, `package.json`, `pyproject.toml`, Gradle files). It writes `.github/workflows/agent-containers.yml`, which calls this repo's reusable `publish.yml` once per target. That publishes only from the default branch, and only when a target's Dockerfile, the compose file or one of those files changed in the push; a manual run always publishes. Rerun `init --force` after adding a target.
+It reads the targets from your compose file and asks for the default branch and the files whose change should rebuild the images, offering what it found (lockfiles, `package.json`, `pyproject.toml`, Gradle files). It writes `.github/workflows/agent-containers.yml`, which calls this repo's reusable `publish.yml` once per target. That publishes only from the default branch, and only when a target's Dockerfile, the compose file or one of those files changed since the commit the published `:default` image was built from; a manual run always publishes. Rerun `init --force` after adding a target.
 
 The declaration is read with `gh`, so its token needs read access to your repo's contents. Pulls authenticate with `gh auth token`, and a private repo's image needs the `read:packages` scope:
 

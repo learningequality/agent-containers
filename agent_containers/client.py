@@ -12,6 +12,7 @@ from typing import BinaryIO
 from agent_containers.broker import ALIVE
 from agent_containers.broker import BROKER_DIR
 from agent_containers.broker import CANCEL
+from agent_containers.broker import EXIT_CANCELLED
 from agent_containers.broker import REQUESTS
 from agent_containers.broker import RESULTS
 from agent_containers.errors import EXIT_TOOL_ERROR
@@ -74,7 +75,7 @@ def request(
                 if done is not None:
                     return done
                 if cancelled_at is not None and time.monotonic() - cancelled_at > CANCEL_WAIT:
-                    return 130
+                    return EXIT_CANCELLED
                 if not claimed and time.monotonic() - asked_at > PICKUP_WAIT:
                     try:
                         queued.unlink()
@@ -88,6 +89,13 @@ def request(
                     return EXIT_TOOL_ERROR
                 time.sleep(POLL_INTERVAL)
             except KeyboardInterrupt:
+                if not claimed:
+                    try:
+                        queued.unlink()
+                    except FileNotFoundError:
+                        claimed = True
+                    else:
+                        return EXIT_CANCELLED
                 if cancelled_at is None:
                     (broker / REQUESTS / f"{request_id}{CANCEL}").write_bytes(b"")
                     cancelled_at = time.monotonic()

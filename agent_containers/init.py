@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 from agent_containers import images
@@ -9,6 +11,7 @@ from agent_containers.images import COMPOSE_FILE
 
 WORKFLOW = ".github/workflows/agent-containers.yml"
 TOOL_REF = "main"
+_UNSAFE_PATH = re.compile(r"[\s\"'\\]")
 DEPENDENCY_FILES = (
     "package.json",
     "package-lock.json",
@@ -46,12 +49,13 @@ def default_branch(worktree: Path) -> str | None:
 
 
 def dependency_files(worktree: Path) -> list[str]:
-    declaration = load(worktree / COMPOSE_FILE)
-    contexts = [worktree, *((worktree / t.build.context).resolve() for t in declaration.targets.values())]
+    root = worktree.resolve()
+    declaration = load(root / COMPOSE_FILE)
+    contexts = [root, *((root / t.build.context).resolve() for t in declaration.targets.values())]
     found: list[str] = []
-    for context in dict.fromkeys(contexts):
+    for context in dict.fromkeys(c for c in contexts if c.is_relative_to(root)):
         matches = {path for pattern in DEPENDENCY_FILES for path in context.glob(pattern) if path.is_file()}
-        found.extend(str(path.relative_to(worktree.resolve())) for path in sorted(matches))
+        found.extend(str(path.relative_to(root)) for path in sorted(matches))
     return list(dict.fromkeys(found))
 
 
@@ -60,7 +64,7 @@ def render(branch: str, targets: list[str], paths: list[str]) -> str:
 
 on:
   push:
-    branches: [{branch}]
+    branches: [{json.dumps(branch)}]
   workflow_dispatch:
 
 jobs:
@@ -71,7 +75,7 @@ jobs:
     uses: learningequality/agent-containers/.github/workflows/publish.yml@{TOOL_REF}
     with:
       target: ${{{{ matrix.target }}}}
-      paths: "{" ".join(paths)}"
+      paths: {json.dumps(" ".join(paths))}
       tool-ref: {TOOL_REF}
     permissions:
       contents: read
@@ -83,6 +87,9 @@ def write(worktree: Path, branch: str, paths: list[str], *, force: bool = False)
     targets = sorted(load(worktree / COMPOSE_FILE).targets)
     if not targets:
         raise ToolError(DECLARE_FIRST)
+    unsplittable = [path for path in paths if _UNSAFE_PATH.search(path)]
+    if unsplittable:
+        raise ToolError(f"the publish job splits paths on whitespace; rename or drop: {', '.join(unsplittable)}")
     path = worktree / WORKFLOW
     if path.exists() and not force:
         raise ToolError(f"{WORKFLOW} exists; pass --force to replace it")

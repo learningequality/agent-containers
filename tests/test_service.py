@@ -36,8 +36,18 @@ def test_install_on_linux_writes_a_user_unit_and_starts_it(home, monkeypatch):
     unit = (home / ".config" / "systemd" / "user" / "agent-containers.service").read_text()
     assert where == str(home / ".config" / "systemd" / "user" / "agent-containers.service")
     assert 'ExecStart="/opt/tools/bin/agent-containers" daemon' in unit
-    assert "Environment=PATH=/opt/tools/bin:/usr/bin" in unit
+    assert 'Environment="PATH=/opt/tools/bin:/usr/bin"' in unit
     assert ["systemctl", "--user", "enable", "--now", "agent-containers.service"] in run.calls
+
+
+def test_a_path_with_spaces_percent_or_quotes_survives_systemd_parsing(home, monkeypatch):
+    monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.setenv("PATH", '/opt/my tools/bin:/x%y:/q"z\\w')
+
+    service.install(Recorded())
+
+    unit = (home / ".config" / "systemd" / "user" / "agent-containers.service").read_text()
+    assert 'Environment="PATH=/opt/my tools/bin:/x%%y:/q\\"z\\\\w"' in unit
 
 
 def test_install_on_macos_writes_a_launch_agent_and_loads_it(home, monkeypatch):

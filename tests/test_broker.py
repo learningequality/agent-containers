@@ -65,6 +65,7 @@ def test_start_writes_a_gitignore_and_a_heartbeat(made, tmp_path):
         {"command": "run", "target": "web", "argv": "ls", "cwd": ""},
         b"x" * (brokers.REQUEST_LIMIT + 1),
         b"not json",
+        b"[" * 60000,
     ],
 )
 def test_bad_requests_are_refused_and_reach_no_instance(made, tmp_path, payload):
@@ -167,6 +168,35 @@ def test_a_cancel_during_start_up_stops_the_command_ever_running(tmp_path):
     assert [call for call in instances[0].calls if call[0] == "run"] == []
 
 
+def test_a_cancel_queued_with_its_request_stops_the_command_ever_running(made, tmp_path):
+    broker, instances = made
+    _submit(tmp_path, "r1", {"command": "run", "target": "web", "argv": ["make", "test"], "cwd": ""})
+    (_dir(tmp_path, "requests") / f"r1{brokers.CANCEL}").write_bytes(b"")
+
+    broker.poll_once()
+
+    assert _exit(tmp_path, "r1") == brokers.EXIT_CANCELLED
+    assert [call for call in instances["web"].calls if call[0] == "run"] == []
+
+
+def test_an_output_file_the_broker_cannot_create_still_answers_the_client(made, tmp_path, monkeypatch):
+    broker, instances = made
+    real = brokers._write_new
+
+    def refuse_stdout(directory, name, data=b""):
+        if name == "stdout":
+            raise FileExistsError(name)
+        return real(directory, name, data)
+
+    monkeypatch.setattr(brokers, "_write_new", refuse_stdout)
+    _submit(tmp_path, "r1", {"command": "run", "target": "web", "argv": ["make", "test"], "cwd": ""})
+
+    broker.poll_once()
+
+    assert _exit(tmp_path, "r1") == EXIT_TOOL_ERROR
+    assert broker._running == {}
+
+
 def test_a_slow_start_up_blocks_no_other_request(tmp_path):
     release = threading.Event()
 
@@ -231,3 +261,13 @@ def test_an_unanswered_request_is_withdrawn_and_names_the_install(tmp_path, monk
     assert b"agent-containers install" in err.getvalue()
     assert list(_dir(tmp_path, "requests").iterdir()) == []
     assert (tmp_path / ".agent-containers" / ".gitignore").read_text() == "*\n"
+
+
+def test_ctrl_c_before_pickup_withdraws_the_request_as_a_cancel(tmp_path):
+    threading.Timer(0.3, _thread.interrupt_main).start()
+    started = time.monotonic()
+
+    code = client.request(tmp_path, "run", "web", ["ls"], "", out=io.BytesIO(), err=io.BytesIO())
+
+    assert (code, time.monotonic() - started < 3) == (brokers.EXIT_CANCELLED, True)
+    assert list(_dir(tmp_path, "requests").iterdir()) == []

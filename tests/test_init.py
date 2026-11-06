@@ -66,6 +66,18 @@ def test_dependency_files_present_in_the_repo_are_found(repo):
     assert init.dependency_files(repo) == ["pnpm-lock.yaml", "uv.lock", "platforms/android/build.gradle"]
 
 
+def test_dependency_files_are_found_through_a_symlinked_worktree_path(repo, tmp_path_factory):
+    link = tmp_path_factory.mktemp("links") / "repo"
+    link.symlink_to(repo)
+    assert init.dependency_files(link) == ["pnpm-lock.yaml", "uv.lock", "platforms/android/build.gradle"]
+
+
+def test_a_build_context_outside_the_worktree_is_skipped(repo):
+    (repo / "docker-compose.yml").write_text("services:\n  web:\n    build: ..\n    x-agent: {}\n")
+    (repo.parent / "uv.lock").write_text("")
+    assert init.dependency_files(repo) == ["pnpm-lock.yaml", "uv.lock"]
+
+
 def test_init_writes_a_publish_job_for_every_declared_target(repo, monkeypatch):
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
 
@@ -115,3 +127,14 @@ def test_a_compose_with_no_target_points_at_declaring_one(repo):
     (repo / "docker-compose.yml").write_text("services:\n  db:\n    image: postgres:16\n")
     with pytest.raises(ToolError, match="Declaring targets"):
         init.write(repo, "develop", [])
+
+
+def test_a_branch_with_yaml_syntax_in_it_survives_into_the_workflow(repo):
+    init.write(repo, "release/v1,#next]", ["uv.lock"])
+    assert _workflow(repo)[True]["push"]["branches"] == ["release/v1,#next]"]
+
+
+@pytest.mark.parametrize("path", ["my lock.txt", 'a"b', "tab\tbed"])
+def test_a_path_the_publish_job_would_split_or_unquote_is_refused(repo, path):
+    with pytest.raises(ToolError, match="path"):
+        init.write(repo, "develop", [path])

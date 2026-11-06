@@ -30,6 +30,11 @@ def _unit_path() -> Path:
     return config_home() / "systemd" / "user" / UNIT
 
 
+def _quoted(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{escaped}"'
+
+
 def _plist_path() -> Path:
     return home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 
@@ -41,7 +46,7 @@ def install(run: Runner = subprocess.run) -> str:
         unit.parent.mkdir(parents=True, exist_ok=True)
         unit.write_text(
             "[Unit]\nDescription=agent-containers: serve sandboxed agents' container requests\n\n"
-            f'[Service]\nExecStart="{executable}" daemon\nEnvironment=PATH={path}\n'
+            f"[Service]\nExecStart={_quoted(executable)} daemon\nEnvironment={_quoted(f'PATH={path}')}\n"
             "Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
         )
         _check(run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True))

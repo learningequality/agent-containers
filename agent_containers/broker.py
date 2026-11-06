@@ -53,8 +53,13 @@ def _open_dir(parent: int, name: str, *, create: bool) -> int:
 
 def _write_new(directory: int, name: str, data: bytes = b"") -> int:
     fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=directory)
-    if data:
-        os.write(fd, data)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+    except BaseException:
+        os.close(fd)
+        raise
     return fd
 
 
@@ -237,11 +242,11 @@ class Broker:
         except OSError:
             return
         try:
+            for request_id in _queued(requests):
+                self._accept(requests, request_id)
             for name in sorted(os.listdir(requests)):
                 if name.endswith(CANCEL):
                     self._cancel(requests, name)
-            for request_id in _queued(requests):
-                self._accept(requests, request_id)
         finally:
             os.close(requests)
 
@@ -275,16 +280,37 @@ class Broker:
                 with contextlib.suppress(OSError):
                     os.unlink(REQUEST, dir_fd=result)
             request = validate(json.loads(payload), self._targets)
-        except (Refused, OSError, ValueError) as exc:
+        except (Refused, OSError, ValueError, RecursionError) as exc:
             _refuse(result, f"agent-containers broker: refused: {exc}\n")
             return
         with self._mutex:
             self._running[request_id] = None
+            if f"{request_id}{CANCEL}" in os.listdir(requests):
+                self._cancelled.add(request_id)
         threading.Thread(target=self._handle, args=(request_id, request, result), daemon=True).start()
 
     def _handle(self, request_id: str, request: dict[str, Any], result: int) -> None:
-        out = os.fdopen(_write_new(result, "stdout"), "wb", buffering=0)
-        err = os.fdopen(_write_new(result, "stderr"), "wb", buffering=0)
+        code = EXIT_TOOL_ERROR
+        try:
+            with (
+                os.fdopen(_write_new(result, "stdout"), "wb", buffering=0) as out,
+                os.fdopen(_write_new(result, "stderr"), "wb", buffering=0) as err,
+            ):
+                code = self._execute(request_id, request, out, err)
+        except OSError:
+            pass
+        finally:
+            with self._mutex:
+                self._running.pop(request_id, None)
+                self._cancelled.discard(request_id)
+            try:
+                _replace(result, "exit", f"{code}\n".encode())
+            except OSError:
+                pass
+            finally:
+                os.close(result)
+
+    def _execute(self, request_id: str, request: dict[str, Any], out, err) -> int:
         code = EXIT_TOOL_ERROR
         try:
             instance = self._instance(request["target"])
@@ -313,18 +339,7 @@ class Broker:
             err.write(f"agent-containers: {exc}\n".encode())
         except Exception as exc:
             err.write(f"agent-containers broker: {type(exc).__name__}: {exc}\n".encode())
-        finally:
-            with self._mutex:
-                self._running.pop(request_id, None)
-                self._cancelled.discard(request_id)
-            out.close()
-            err.close()
-            try:
-                _replace(result, "exit", f"{code}\n".encode())
-            except OSError:
-                pass
-            finally:
-                os.close(result)
+        return code
 
     def _instance(self, target: str) -> Any:
         with self._mutex:

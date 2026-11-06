@@ -1,7 +1,9 @@
 import http.server
+import subprocess
 import threading
 
 import pytest
+from fakes import ListedRuntime
 
 from agent_containers import instance
 from agent_containers import runtime
@@ -137,3 +139,128 @@ def test_fresh_rebuilds_the_image_of_a_running_instance(tmp_path, monkeypatch, f
 def test_spec_rejects_given_ports_that_miss_a_declared_one(tmp_path):
     with pytest.raises(ToolError, match="4000"):
         instance.make_spec(runtime.Runtime("podman"), parse(COMPOSE), "app", tmp_path, "img", host_ports={8000: 1})
+
+
+VOLUMES = """
+services:
+  db:
+    image: postgres:16
+    volumes: [pgdata:/var/lib/postgresql/data]
+  app:
+    build: .
+    volumes: [cache:/cache]
+    x-agent:
+      state: /state
+volumes:
+  pgdata:
+  cache:
+"""
+
+
+class _Claiming(runtime.Runtime):
+    def __init__(self, existing=()):
+        super().__init__("docker")
+        self.existing = existing
+        self.claimed = {}
+
+    def labelled(self, kind, labels):
+        return [runtime.Resource(name, {}) for name in self.existing] if kind == "volume" else []
+
+    def remove(self, labels, *, volumes):
+        pass
+
+    def run(self, args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def create_network(self, spec):
+        return runtime.layout("10.89.0.0/24", spec)
+
+    def start_gateway(self, spec, addresses):
+        pass
+
+    def start_sidecar(self, spec, sidecar, addresses):
+        pass
+
+    def start_target(self, spec, addresses):
+        pass
+
+    def claim_volume(self, image, volume, path):
+        self.claimed[volume] = path
+
+
+def _claims(tmp_path, monkeypatch, existing_names=()):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    names = runtime.Names("default", "claims")
+    rt = _Claiming([names.volume(name) for name in existing_names])
+    spec = instance.make_spec(rt, parse(VOLUMES), "app", tmp_path, "img", instance="claims", host_ports={})
+    instance.Instance(rt, spec).up(fresh=True)
+    return rt.claimed, names
+
+
+def test_up_hands_only_the_targets_new_volumes_to_the_user(tmp_path, monkeypatch):
+    claimed, names = _claims(tmp_path, monkeypatch)
+    assert claimed == {names.volume("cache"): "/cache", names.state: "/state"}
+
+
+def test_up_leaves_a_volume_that_already_exists_alone(tmp_path, monkeypatch):
+    claimed, names = _claims(tmp_path, monkeypatch, existing_names=("state",))
+    assert claimed == {names.volume("cache"): "/cache"}
+
+
+SERVING = """
+services:
+  app:
+    build: .
+    x-agent:
+      commands: {serve: make serve}
+      ready: {command: probe, timeout: 30}
+"""
+
+
+def _serving(tmp_path, recorded):
+    rt = runtime.Runtime("podman")
+    rt.run = lambda args, **kwargs: recorded.append(args) or subprocess.CompletedProcess(args, 0, "", "")
+    spec = instance.make_spec(rt, parse(SERVING), "app", tmp_path, "img", host_ports={})
+    made = instance.Instance(rt, spec)
+    made.up = lambda **kwargs: None
+    return made
+
+
+def test_serve_clears_the_last_exit_code_before_it_launches(tmp_path, monkeypatch):
+    recorded = []
+    made = _serving(tmp_path, recorded)
+    probes = iter([(False, "down"), (True, "up")])
+    monkeypatch.setattr(made, "_probe", lambda: next(probes))
+    monkeypatch.setattr(made, "_wait_served", lambda: None)
+
+    made.serve()
+
+    launch = next(i for i, args in enumerate(recorded) if "-d" in args)
+    clears = [i for i, args in enumerate(recorded) if "rm" in " ".join(args) and made.rc in " ".join(args)]
+    assert clears and clears[0] < launch
+    assert made.rc not in " ".join(recorded[launch]).split("rm -f")[-1].split("&&")[0]
+
+
+def test_a_ready_command_that_times_out_is_a_failed_probe(tmp_path, monkeypatch):
+    made = _serving(tmp_path, [])
+
+    def hang(*args, **kwargs):
+        raise ToolError("ready command timed out after 60s")
+
+    monkeypatch.setattr(made, "_exec", hang)
+
+    assert made._probe() == (False, "ready command timed out after 60s")
+
+
+def test_reap_skips_a_worktree_whose_parent_is_also_missing(tmp_path):
+    (tmp_path / "github").mkdir()
+    listed = ListedRuntime(
+        {
+            "deleted": tmp_path / "github" / "deleted",
+            "unmounted": tmp_path / "usb-drive" / "repo",
+            "present": tmp_path,
+        }
+    )
+
+    assert instance.reap(listed, "ns") == ["deleted"]
+    assert listed.removed == ["deleted"]

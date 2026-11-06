@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
+from typing import Any
 
 from agent_containers import gateway
 from agent_containers.declaration import PROXY_PORT
@@ -38,10 +39,13 @@ LABEL_TARGET = "agent-containers.target"
 LABEL_PORTS = "agent-containers.ports"
 QUICK_TIMEOUT = 60
 SUBNET_ATTEMPTS = 20
+SUBNET_POOLS = tuple(ipaddress.IPv4Network(n) for n in ("10.128.0.0/9", "172.16.0.0/12", "192.168.0.0/16"))
 GATEWAY_START_TIMEOUT = 60
 LOG_TAIL = 2000
 # RFC 6177 / RIPE-690: a site is delegated a /48 to /56, so another /64 inside it is another of its LANs.
 SITE_PREFIX = 56
+# Not `is_private`: before Python 3.13 it checks only the end addresses, so 0.0.0.0/1 counts as private.
+PRIVATE_IPV4 = tuple(ipaddress.IPv4Network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
 
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -207,12 +211,11 @@ def git_mounts(worktree: Path, mount: str, dirs: tuple[Path, ...] | None = None)
 def host_networks() -> tuple[Network, ...]:
     addresses: list[str] = []
     if shutil.which("ip"):
-        shown = subprocess.run(["ip", "-j", "addr", "show"], capture_output=True, text=True, errors="replace")
-        if shown.returncode == 0:
-            for link in json.loads(shown.stdout or "[]"):
-                for addr in link.get("addr_info", ()):
-                    if "local" in addr:
-                        addresses.append(f"{addr['local']}/{addr['prefixlen']}")
+        for link in _ip_json("addr"):
+            for addr in link.get("addr_info", ()):
+                if "local" in addr:
+                    addresses.append(f"{addr['local']}/{addr['prefixlen']}")
+        addresses += _routed_networks(_ip_json("route"))
     elif shutil.which("ifconfig"):
         shown = subprocess.run(["ifconfig"], capture_output=True, text=True, errors="replace")
         addresses = _ifconfig_addresses(shown.stdout)
@@ -223,6 +226,23 @@ def host_networks() -> tuple[Network, ...]:
         except ValueError:
             continue
     return tuple(dict.fromkeys(networks))
+
+
+def _ip_json(kind: str) -> list[dict[str, Any]]:
+    shown = subprocess.run(["ip", "-j", kind, "show"], capture_output=True, text=True, errors="replace")
+    return json.loads(shown.stdout or "[]") if shown.returncode == 0 else []
+
+
+def _routed_networks(routes: list[dict[str, Any]]) -> list[str]:
+    found = []
+    for route in routes:
+        try:
+            network = ipaddress.ip_network(route.get("dst", ""))
+        except ValueError:
+            continue
+        if network.version == 4 and any(network.subnet_of(private) for private in PRIVATE_IPV4):
+            found.append(route["dst"])
+    return found
 
 
 def _ifconfig_addresses(text: str) -> list[str]:
@@ -481,13 +501,25 @@ class Runtime:
         ]
 
     def create_network(self, spec: Spec) -> Addresses:
+        denied = [network for network in spec.denied if network.version == 4]
+        pools = [pool for pool in SUBNET_POOLS if not any(pool.subnet_of(network) for network in denied)]
+        if not pools:
+            covering = ", ".join(map(str, denied))
+            raise ToolError(
+                f"could not create {spec.names.network}: host networks {covering} cover every private range"
+            )
         failures = []
-        for _ in range(SUBNET_ATTEMPTS):
-            subnet = f"10.{random.randint(128, 254)}.{random.randint(0, 255)}.0/24"
-            result = self.run(self.network_args(spec, subnet), what="create network", check=False)
-            if result.returncode == 0:
-                return layout(subnet, spec)
-            failures.append(result.stderr.strip())
+        for pool in pools:
+            for _ in range(SUBNET_ATTEMPTS):
+                offset = 256 * random.randrange(pool.num_addresses // 256)
+                subnet = ipaddress.IPv4Network((int(pool.network_address) + offset, 24))
+                if any(subnet.overlaps(network) for network in denied):
+                    failures.append(f"{subnet} overlaps a host network")
+                    continue
+                result = self.run(self.network_args(spec, str(subnet)), what="create network", check=False)
+                if result.returncode == 0:
+                    return layout(str(subnet), spec)
+                failures.append(result.stderr.strip())
         raise ToolError(f"could not create {spec.names.network} on any free subnet: {failures[-1]}")
 
     def start_gateway(self, spec: Spec, addresses: Addresses) -> None:

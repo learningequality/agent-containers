@@ -1,7 +1,8 @@
+import contextlib
 import io
 import threading
-import time
 
+import pytest
 from fakes import FakeInstance
 
 from agent_containers import broker as brokers
@@ -46,28 +47,34 @@ def _fake_broker(worktree):
     return brokers.Broker(worktree, None, "test", None, factory=FakeInstance, targets=("web",))
 
 
-def _pump(made, rounds=60):
+@contextlib.contextmanager
+def _pumping(made):
+    stop = threading.Event()
+
     def loop():
-        for _ in range(rounds):
+        while not stop.wait(0.05):
             made.scan_once()
             made.poll_once()
-            time.sleep(0.05)
 
     thread = threading.Thread(target=loop, daemon=True)
     thread.start()
-    return thread
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+        made.close()
 
 
 def test_a_client_in_a_worktree_under_a_root_is_served(tmp_path):
     worktree = tmp_path / "github" / "kolibri"
     worktree.mkdir(parents=True)
     made = daemon.Daemon(broker_factory=_fake_broker, roots=lambda: [tmp_path / "github"])
-    _pump(made)
     out, err = io.BytesIO(), io.BytesIO()
 
-    code = client.request(worktree, "run", "web", ["make", "test", "4"], "", out=out, err=err)
+    with _pumping(made):
+        code = client.request(worktree, "run", "web", ["make", "test", "4"], "", out=out, err=err)
 
-    made.close()
     assert code == 4, err.getvalue()
     assert out.getvalue() == b"out:make test 4\n"
 
@@ -89,12 +96,11 @@ def test_a_worktree_outside_every_root_is_never_served(tmp_path, monkeypatch):
     worktree = tmp_path / "elsewhere"
     worktree.mkdir()
     made = daemon.Daemon(broker_factory=_fake_broker, roots=lambda: [tmp_path / "github"])
-    _pump(made)
     err = io.BytesIO()
 
-    code = client.request(worktree, "run", "web", ["true"], "", out=io.BytesIO(), err=err)
+    with _pumping(made):
+        code = client.request(worktree, "run", "web", ["true"], "", out=io.BytesIO(), err=err)
 
-    made.close()
     assert code == EXIT_TOOL_ERROR
     assert b"agent-containers install" in err.getvalue()
     assert str(worktree).encode() in err.getvalue()
@@ -115,7 +121,11 @@ def test_removing_a_root_stops_serving_its_worktrees(tmp_path):
     made.close()
 
 
-def test_a_worktree_whose_broker_cannot_start_has_its_requests_refused_with_the_reason(tmp_path):
+@pytest.mark.parametrize(
+    "error",
+    [ToolError("neither upstream nor origin is a GitHub remote"), FileNotFoundError("no GitHub remote: worktree gone")],
+)
+def test_a_worktree_whose_broker_cannot_start_has_its_requests_refused_with_the_reason(tmp_path, error):
     worktree = tmp_path / "github" / "kolibri"
     requests = _requests(worktree)
     (requests / "r1.json").write_text('{"command": "run", "target": null, "argv": ["true"], "cwd": ""}')
@@ -125,7 +135,7 @@ def test_a_worktree_whose_broker_cannot_start_has_its_requests_refused_with_the_
             pass
 
         def start(self):
-            raise ToolError("neither upstream nor origin is a GitHub remote")
+            raise error
 
     made = daemon.Daemon(broker_factory=Broken, roots=lambda: [tmp_path / "github"])
     made.scan_once()

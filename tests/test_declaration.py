@@ -1,3 +1,4 @@
+import re
 from dataclasses import asdict
 from pathlib import Path
 
@@ -102,6 +103,41 @@ services:
     sidecar = declaration.sidecars["db"]
     assert sidecar.environment == {"A": "1", "B": "two=2"}
     assert sidecar.command == ("postgres", "-c", "fsync=off")
+
+
+@pytest.mark.parametrize(
+    ("text", "named"),
+    [
+        ("services: [unclosed", "malformed"),
+        ("volumes: [data]\nservices: {}\n", "volumes"),
+        ("services:\n  db:\n    image: x\n    healthcheck: pg_isready\n", "'db': healthcheck"),
+        ("services:\n  db:\n    image: x\n    healthcheck: {test: 5}\n", "'db': healthcheck: test"),
+        (
+            "services:\n  db:\n    image: x\n    healthcheck: {test: [CMD, x], retries: [1]}\n",
+            "'db': healthcheck: retries",
+        ),
+        ("services:\n  db:\n    image: x\n    environment: 5\n", "'db': environment"),
+        ("services:\n  db:\n    image: x\n    volumes: 5\n", "'db': volumes"),
+        ("services:\n  db:\n    image: x\n    command: 5\n", "'db': command"),
+        ("services:\n  app:\n    build: .\n    x-agent:\n      commands: [make test]\n", "'app': commands"),
+        ("services:\n  app:\n    build: .\n    x-agent:\n      ports: [8000]\n", "'app': ports"),
+        ("services:\n  app:\n    build: .\n    x-agent:\n      hosts: 5\n", "'app': hosts"),
+        ("services:\n  app:\n    build: .\n    x-agent:\n      devices: 3\n", "'app': devices"),
+        (
+            "services:\n  app:\n    build: .\n    x-agent:\n      ports: {'8000': {env: P}}\n"
+            "      ready: {path: /, port: 8000, timeout: soon}\n",
+            "timeout",
+        ),
+        ("services:\n  app:\n    build: .\n    x-agent:\n      host: [pypi.org]\n", "unknown keys host ("),
+        (
+            "services:\n  app:\n    build: .\n    x-agent:\n      ready: {command: 'true', timout: 30}\n",
+            "unknown keys timout (",
+        ),
+    ],
+)
+def test_a_malformed_declaration_is_a_value_error_naming_the_problem(text, named):
+    with pytest.raises(ValueError, match=re.escape(named)):
+        parse(text)
 
 
 def test_unknown_device_fails():
