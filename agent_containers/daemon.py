@@ -17,9 +17,14 @@ from agent_containers.broker import Broker
 from agent_containers.broker import refuse_pending
 from agent_containers.config import load_roots
 from agent_containers.errors import ToolError
+from agent_containers.instance import deleted_instances
+from agent_containers.runtime import Names
+from agent_containers.runtime import Runtime
+from agent_containers.runtime import detect
 from agent_containers.runtime import namespace
 
 SCAN_INTERVAL = 2.0
+REAP_INTERVAL = 3600.0
 RETRY_AFTER = 30.0
 DEPTH = 3
 SKIPPED = {"node_modules", "__pycache__", "venv"}
@@ -66,9 +71,12 @@ class Daemon:
         self,
         broker_factory: Callable[[Path], Any] = _real_broker,
         roots: Callable[[], list[Path]] = load_roots,
+        runtime: Callable[[], Runtime] = detect,
     ):
         self._broker_factory = broker_factory
         self._roots = roots
+        self._runtime = runtime
+        self._missing: set[str] = set()
         self._brokers: dict[Path, Any] = {}
         self._failed: dict[Path, tuple[float, str]] = {}
         self._closed = threading.Event()
@@ -101,7 +109,22 @@ class Daemon:
         for made in list(self._brokers.values()):
             made.poll_once()
 
+    def reap_once(self) -> None:
+        try:
+            runtime, ns = self._runtime(), namespace()
+            missing = deleted_instances(runtime, ns, self._roots())
+            for instance in sorted(missing & self._missing):
+                runtime.remove(Names(ns, instance).labels(), volumes=True)
+            self._missing = missing
+        except (ToolError, OSError) as exc:
+            print(f"agent-containers daemon: {exc}", file=sys.stderr, flush=True)
+
+    def _reap_forever(self) -> None:
+        while not self._closed.wait(REAP_INTERVAL):
+            self.reap_once()
+
     def serve_forever(self) -> None:
+        threading.Thread(target=self._reap_forever, daemon=True).start()
         scanned = 0.0
         while not self._closed.wait(POLL_INTERVAL):
             if time.monotonic() - scanned >= SCAN_INTERVAL:

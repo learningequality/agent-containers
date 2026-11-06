@@ -452,14 +452,20 @@ def _pidfile(group: str) -> str:
     return f"/tmp/.agent-containers-{_safe(group)}.pid"
 
 
-def reap(runtime: Runtime, ns: str) -> list[str]:
-    reaped: set[str] = set()
+def deleted_instances(runtime: Runtime, ns: str, roots: list[Path] | None = None) -> set[str]:
+    deleted: set[str] = set()
     for kind in ("container", "volume", "network"):
         for resource in runtime.labelled(kind, {LABEL_NAMESPACE: ns}):
             worktree = Path(resource.labels.get(LABEL_WORKTREE) or "")
-            deleted = worktree.is_absolute() and not worktree.exists() and worktree.parent.is_dir()
-            if deleted and resource.labels.get(LABEL_INSTANCE):
-                reaped.add(resource.labels[LABEL_INSTANCE])
-    for instance in sorted(reaped):
+            gone = worktree.is_absolute() and not worktree.exists() and worktree.parent.is_dir()
+            allowed = roots is None or any(worktree.is_relative_to(root) for root in roots)
+            if gone and allowed and resource.labels.get(LABEL_INSTANCE):
+                deleted.add(resource.labels[LABEL_INSTANCE])
+    return deleted
+
+
+def reap(runtime: Runtime, ns: str) -> list[str]:
+    reaped = sorted(deleted_instances(runtime, ns))
+    for instance in reaped:
         runtime.remove(Names(ns, instance).labels(), volumes=True)
-    return sorted(reaped)
+    return reaped

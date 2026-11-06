@@ -4,6 +4,7 @@ import threading
 
 import pytest
 from fakes import FakeInstance
+from fakes import ListedRuntime
 
 from agent_containers import broker as brokers
 from agent_containers import client
@@ -144,3 +145,97 @@ def test_a_worktree_whose_broker_cannot_start_has_its_requests_refused_with_the_
     assert (result / "exit").read_text().strip() == str(EXIT_TOOL_ERROR)
     assert "GitHub remote" in (result / "stderr").read_text()
     assert not (requests / "r1.json").exists()
+
+
+def _reaper(tmp_path, worktrees):
+    listed = ListedRuntime(worktrees)
+    made = daemon.Daemon(broker_factory=_fake_broker, roots=lambda: [tmp_path / "github"], runtime=lambda: listed)
+    return listed, made
+
+
+def test_a_deleted_worktree_is_reaped_only_on_the_second_check(tmp_path):
+    (tmp_path / "github").mkdir()
+    listed, made = _reaper(tmp_path, {"gone": tmp_path / "github" / "gone"})
+
+    made.reap_once()
+    assert listed.removed == []
+
+    made.reap_once()
+    assert listed.removed == ["gone"]
+
+
+def test_a_worktree_that_comes_back_between_checks_is_kept(tmp_path):
+    worktree = tmp_path / "github" / "back"
+    (tmp_path / "github").mkdir()
+    listed, made = _reaper(tmp_path, {"back": worktree})
+
+    made.reap_once()
+    worktree.mkdir()
+    made.reap_once()
+    worktree.rmdir()
+    made.reap_once()
+
+    assert listed.removed == []
+
+
+def test_an_instance_outside_every_root_is_never_reaped(tmp_path):
+    (tmp_path / "github").mkdir()
+    (tmp_path / "elsewhere").mkdir()
+    listed, made = _reaper(tmp_path, {"outside": tmp_path / "elsewhere" / "gone"})
+
+    made.reap_once()
+    made.reap_once()
+
+    assert listed.removed == []
+
+
+@pytest.mark.parametrize(
+    "error", [ToolError("neither podman nor docker is on PATH"), PermissionError("cannot stat /home/x/repo")]
+)
+def test_a_failing_reap_does_not_stop_the_service(tmp_path, error):
+    def failing():
+        raise error
+
+    made = daemon.Daemon(broker_factory=_fake_broker, roots=lambda: [tmp_path], runtime=failing)
+
+    made.reap_once()
+
+
+def test_a_slow_reap_does_not_stall_polling(monkeypatch):
+    monkeypatch.setattr(daemon, "REAP_INTERVAL", 0.01)
+    reaping, release, polled = threading.Event(), threading.Event(), threading.Event()
+    made = daemon.Daemon(broker_factory=_fake_broker, roots=lambda: [])
+
+    def slow_reap():
+        reaping.set()
+        release.wait(10)
+
+    def poll():
+        if reaping.is_set():
+            polled.set()
+
+    monkeypatch.setattr(made, "reap_once", slow_reap)
+    monkeypatch.setattr(made, "poll_once", poll)
+    thread = threading.Thread(target=made.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        assert polled.wait(5)
+    finally:
+        release.set()
+        made.close()
+        thread.join(5)
+
+
+def test_the_service_loop_reaps_on_its_interval(tmp_path, monkeypatch):
+    monkeypatch.setattr(daemon, "REAP_INTERVAL", 0.05)
+    reaped = threading.Event()
+    made = daemon.Daemon(broker_factory=_fake_broker, roots=lambda: [])
+    monkeypatch.setattr(made, "reap_once", reaped.set)
+    thread = threading.Thread(target=made.serve_forever, daemon=True)
+    thread.start()
+
+    assert reaped.wait(5)
+
+    made.close()
+    thread.join(5)

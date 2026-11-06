@@ -30,9 +30,10 @@ agent-containers run web -- pnpm test-jest    # a named target
 agent-containers serve web                    # start `serve`, print its URLs and log path
 agent-containers status                       # this worktree's containers
 agent-containers stop [web] [--purge]         # stop; --purge also drops volumes
-agent-containers reap                         # remove instances whose worktree was deleted (its parent folder remains)
+agent-containers reap                         # remove instances whose worktree was deleted
 ```
 
+- `reap` skips a worktree whose parent folder is also missing, such as an unmounted drive. The service reaps under its roots hourly, once a worktree has been gone for two checks.
 - `run` exits with the command's exit code; a failure of the tool itself exits 125.
 - A command runs in the same directory inside the container as you ran it from outside.
 - The first command on a worktree starts its containers; later ones reuse them. `--fresh` recreates them, keeping volumes.
