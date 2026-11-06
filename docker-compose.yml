@@ -1,0 +1,15 @@
+services:
+  generic:
+    build:
+      context: images/generic
+    x-agent:
+      hosts:
+        - pypi.org
+        - files.pythonhosted.org
+        - registry.npmjs.org
+        - registry.yarnpkg.com
+        - nodejs.org
+        - github.com
+        - objects.githubusercontent.com
+        - release-assets.githubusercontent.com
+      state: /state
