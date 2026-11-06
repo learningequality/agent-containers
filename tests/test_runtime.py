@@ -1,4 +1,5 @@
 import ipaddress
+import os
 import socket
 import subprocess
 from pathlib import Path
@@ -274,6 +275,26 @@ def test_short_sidecar_images_mean_docker_hub_as_compose_does(tmp_path, image, q
     spec = _spec(tmp_path, compose=compose, target="app", host_ports={}, git_mounts=())
     argv = runtime.Runtime("podman").sidecar_args(spec, spec.sidecars[0], _addresses(spec))
     assert qualified in argv
+
+
+@pytest.mark.parametrize(
+    ("name", "rootless", "claims"), [("docker", False, True), ("docker", True, False), ("podman", False, False)]
+)
+def test_only_rootful_docker_hands_new_target_volumes_to_the_user(monkeypatch, name, rootless, claims):
+    rt = runtime.Runtime(name)
+    rt._rootless = rootless
+    recorded = _Recorded()
+    monkeypatch.setattr(rt, "run", recorded)
+
+    rt.claim_volume("img:default", "ac-x-state", "/state")
+
+    helper = [call for call in recorded.calls if "chown" in call]
+    assert bool(helper) is claims
+    if claims:
+        argv = helper[0]
+        assert argv[-4:] == ["img:default", "-R", f"{os.getuid()}:{os.getgid()}", "/state"]
+        assert "--privileged" not in argv and _values(argv, "--network") == ["none"]
+        assert "ac-x-state:/state" in _values(argv, "--volume")
 
 
 @pytest.mark.parametrize(("installed", "chosen"), [({"podman", "docker"}, "podman"), ({"docker"}, "docker")])

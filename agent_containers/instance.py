@@ -244,6 +244,9 @@ class Instance:
             self.runtime.remove(self.labels, volumes=False)
             created = self._ensure_volumes()
             try:
+                for volume, path in self._target_volumes().items():
+                    if volume in created:
+                        self.runtime.claim_volume(self.spec.image, volume, path)
                 addresses = self.runtime.create_network(self.spec)
                 self.runtime.start_gateway(self.spec, addresses)
                 for sidecar in self.spec.sidecars:
@@ -328,6 +331,12 @@ class Instance:
     def _exec(self, argv: list[str], *, what: str, **kwargs) -> subprocess.CompletedProcess[str]:
         exec_args = self.runtime.exec_args(self.container, argv, workdir=self.spec.mount, interactive="input" in kwargs)
         return self.runtime.run(exec_args, what=what, check=False, **kwargs)
+
+    def _target_volumes(self) -> dict[str, str]:
+        mounted = {self.spec.names.volume(v.name): v.path for v in self.spec.target.volumes}
+        if self.spec.target.state:
+            mounted[self.spec.names.state] = self.spec.target.state
+        return mounted
 
     def _ensure_volumes(self) -> list[str]:
         wanted = {volume.name for sidecar in self.spec.sidecars for volume in sidecar.volumes}

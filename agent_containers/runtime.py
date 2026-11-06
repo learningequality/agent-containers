@@ -312,6 +312,31 @@ class Runtime:
                 self._rootless = False
         return [] if self._rootless else ["--user", f"{os.getuid()}:{os.getgid()}"]
 
+    def claim_volume(self, image: str, volume: str, path: str) -> None:
+        if self.name == "podman" or not self.user_args():
+            return
+        argv = [
+            "run",
+            "--rm",
+            "--user",
+            "0",
+            "--cap-drop=ALL",
+            *(f"--cap-add={cap}" for cap in ("CHOWN", "DAC_OVERRIDE", "FOWNER")),
+            "--security-opt",
+            "no-new-privileges",
+            "--network",
+            "none",
+            "--volume",
+            f"{volume}:{path}",
+            "--entrypoint",
+            "chown",
+            image,
+            "-R",
+            f"{os.getuid()}:{os.getgid()}",
+            path,
+        ]
+        self.run(argv, what=f"hand {volume} to you", timeout=600)
+
     def run(
         self,
         args: list[str],
