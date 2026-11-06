@@ -281,6 +281,13 @@ def test_short_sidecar_images_mean_docker_hub_as_compose_does(tmp_path, image, q
     assert qualified in argv
 
 
+@pytest.mark.parametrize(("name", "inhibited"), [("docker", True), ("podman", False)])
+def test_only_docker_is_told_to_keep_the_host_off_the_bridge(tmp_path, name, inhibited):
+    argv = runtime.Runtime(name).network_args(_spec(tmp_path), "10.89.0.0/24")
+
+    assert ("com.docker.network.bridge.inhibit_ipv4=true" in _values(argv, "--opt")) is inhibited
+
+
 def test_the_internal_subnet_never_overlaps_a_host_network(tmp_path, monkeypatch):
     spec = _spec(tmp_path, denied=(ipaddress.ip_network("10.200.0.0/16"),))
     picks = iter([(200 - 128) * 256 + 7, (201 - 128) * 256 + 7])

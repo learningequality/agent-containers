@@ -381,12 +381,14 @@ class Runtime:
         return result
 
     def network_args(self, spec: Spec, subnet: str) -> list[str]:
-        no_dns = ["--disable-dns"] if self.name == "podman" else []
+        isolation = (
+            ["--disable-dns"] if self.name == "podman" else ["--opt", "com.docker.network.bridge.inhibit_ipv4=true"]
+        )
         return [
             "network",
             "create",
             "--internal",
-            *no_dns,
+            *isolation,
             "--subnet",
             subnet,
             *flags("--label", spec.labels("network")),
