@@ -177,7 +177,7 @@ class Broker:
         repo: str | None,
         namespace: str,
         instance_id: str | None,
-        host_ports: dict[str, dict[int, int]] | None = None,
+        host_ports: dict[str, dict[int | str, int]] | None = None,
         *,
         runtime: str | None = None,
         factory: Callable[[str], Any] | None = None,

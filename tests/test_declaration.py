@@ -247,6 +247,56 @@ services:
         )
 
 
+SIDECAR_PORTS = """
+services:
+  app:
+    build: .
+    x-agent:
+      ports:
+        "8000": {{env: APP_PORT}}
+        "{key}": {{env: SIDE_PORT}}
+  other:
+    build: .
+    x-agent: {{}}
+  gcs:
+    image: fsouza/fake-gcs-server:1.55.1
+"""
+
+
+@pytest.mark.parametrize(
+    ("key", "port"),
+    [("gcs:4443", Port(4443, 4443, "SIDE_PORT", "gcs")), ("gcs:4443-4445", Port(4443, 4445, "SIDE_PORT", "gcs"))],
+)
+def test_a_port_may_name_a_sidecar_declared_after_the_target(key, port):
+    ports = parse(SIDECAR_PORTS.format(key=key)).targets["app"].ports
+    assert ports == (Port(8000, 8000, "APP_PORT"), port)
+    assert port.key == key.partition("-")[0]
+    assert ports[0].key == 8000
+
+
+@pytest.mark.parametrize(
+    ("key", "named"),
+    [
+        ("cache:6379", "target 'app': port 'cache:6379' names no sidecar (sidecars: gcs)"),
+        ("other:9000", "target 'app': port 'other:9000' names no sidecar (sidecars: gcs)"),
+        ("app:9000", "target 'app': port 'app:9000' names the target itself; write '9000'"),
+        ("gcs:", "port 'gcs:' is neither a port nor a range"),
+        (":4443", "port ':4443' is neither a port nor a range"),
+    ],
+)
+def test_a_port_naming_anything_but_a_sidecar_fails(key, named):
+    with pytest.raises(ValueError, match=re.escape(named)):
+        parse(SIDECAR_PORTS.format(key=key))
+
+
+def test_ready_probes_only_the_targets_own_ports():
+    text = SIDECAR_PORTS.format(key="gcs:4443").replace(
+        "x-agent:\n      ports:", "x-agent:\n      ready: {path: /, port: 4443}\n      ports:", 1
+    )
+    with pytest.raises(ValueError, match="ready's port 4443"):
+        parse(text)
+
+
 def test_a_compose_without_targets_ignores_services_it_cannot_run():
     undeclared = (FIXTURES / "kdp-compose.yml").read_text().split("    x-agent:")[0]
     declaration = parse(undeclared + "volumes:\n  kdp-postgres:\n")

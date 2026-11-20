@@ -26,6 +26,7 @@ services:
       ports:
         "8000": {{env: APP_PORT}}
         "4000-4100": {{env: APP_RANGE}}
+        "db:5432": {{env: DB_PORT}}
 """
 
 
@@ -137,10 +138,7 @@ def test_a_sidecar_resolves_by_its_compose_name(instance):
     assert result.stdout.strip() == "200", result.stderr
 
 
-def test_the_published_host_port_reaches_the_serve_port(instance):
-    rt, spec, container, _ = instance
-    rt.run(["exec", "-d", container, "python3", "-m", "http.server", "8000"], what="serve")
-    url = f"http://127.0.0.1:{spec.host_ports[8000]}/"
+def _answers(url):
     deadline = time.monotonic() + 30
     while True:
         try:
@@ -152,10 +150,22 @@ def test_the_published_host_port_reaches_the_serve_port(instance):
             time.sleep(0.5)
 
 
+def test_the_published_host_port_reaches_the_serve_port(instance):
+    rt, spec, container, _ = instance
+    rt.run(["exec", "-d", container, "python3", "-m", "http.server", "8000"], what="serve")
+    _answers(f"http://127.0.0.1:{spec.host_ports[8000]}/")
+
+
+def test_a_published_sidecar_port_reaches_the_sidecar(instance):
+    _, spec, _, _ = instance
+    _answers(f"http://127.0.0.1:{spec.host_ports['db:5432']}/")
+
+
 def test_the_target_is_told_its_host_ports(instance):
     rt, spec, container, _ = instance
-    result = rt.run(["exec", container, "sh", "-c", "echo $APP_PORT $APP_RANGE"], what="echo")
-    assert result.stdout.split() == [str(spec.host_ports[8000]), str(spec.host_ports[4000])]
+    result = rt.run(["exec", container, "sh", "-c", "echo $APP_PORT $APP_RANGE $DB_PORT"], what="echo")
+    expected = [spec.host_ports[8000], spec.host_ports[4000], spec.host_ports["db:5432"]]
+    assert result.stdout.split() == [str(port) for port in expected]
 
 
 def test_orphaned_processes_are_reaped(instance):

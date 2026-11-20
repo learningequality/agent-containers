@@ -34,6 +34,7 @@ class Port:
     start: int
     end: int
     env: str
+    service: str = ""
 
     def __post_init__(self) -> None:
         if not (0 < self.start <= self.end < 65536):
@@ -46,6 +47,10 @@ class Port:
     @property
     def count(self) -> int:
         return self.end - self.start + 1
+
+    @property
+    def key(self) -> int | str:
+        return f"{self.service}:{self.start}" if self.service else self.start
 
     def covers(self, port: int) -> bool:
         return self.start <= port <= self.end
@@ -109,7 +114,7 @@ class Target:
             _check_host(host)
         if SERVE in self.commands and self.ready is None:
             raise ValueError(f"target {self.name!r}: {SERVE} needs ready")
-        if self.ready and self.ready.port and not any(p.covers(self.ready.port) for p in self.ports):
+        if self.ready and self.ready.port and not any(p.covers(self.ready.port) for p in self.own_ports):
             raise ValueError(f"target {self.name!r}: ready's port {self.ready.port} is not a declared port")
         if self.state and not self.state.startswith("/"):
             raise ValueError(f"target {self.name!r}: state {self.state!r} is not an absolute path")
@@ -117,6 +122,10 @@ class Target:
     @property
     def serves(self) -> bool:
         return SERVE in self.commands
+
+    @property
+    def own_ports(self) -> tuple[Port, ...]:
+        return tuple(port for port in self.ports if not port.service)
 
 
 @dataclass(frozen=True)
@@ -171,7 +180,20 @@ def _parse(text: str) -> Declaration:
     if targets and unrunnable:
         names = ", ".join(repr(name) for name in unrunnable)
         raise ValueError(f"service {names} needs an image or an x-agent block: the tool builds only targets")
+    for target in targets.values():
+        _check_port_services(target, sidecars)
     return Declaration(targets=targets, sidecars=sidecars)
+
+
+def _check_port_services(target: Target, sidecars: dict[str, Sidecar]) -> None:
+    for port in target.ports:
+        if not port.service or port.service in sidecars:
+            continue
+        span = str(port.start) if port.count == 1 else f"{port.start}-{port.end}"
+        where = f"target {target.name!r}: port '{port.service}:{span}'"
+        if port.service == target.name:
+            raise ValueError(f"{where} names the target itself; write '{span}'")
+        raise ValueError(f"{where} names no sidecar (sidecars: {', '.join(sorted(sidecars)) or 'none'})")
 
 
 def _target(name: str, service: dict[str, Any], named: set[str]) -> Target:
@@ -222,19 +244,20 @@ def _known_keys(where: str, value: Any, known: frozenset[str]) -> None:
 
 def _sidecar(name: str, service: dict[str, Any], named: set[str]) -> Sidecar:
     where = f"service {name!r}"
-    command = service.get("command")
     return Sidecar(
         name=name,
         image=str(service.get("image") or ""),
         environment=_environment(f"{where}: environment", service.get("environment")),
-        command=(
-            tuple(shlex.split(command))
-            if isinstance(command, str)
-            else tuple(str(c) for c in _sequence(f"{where}: command", command))
-        ),
+        command=_command(f"{where}: command", service.get("command")),
         healthcheck=_healthcheck(f"{where}: healthcheck", service.get("healthcheck")),
         volumes=_volumes(f"{where}: volumes", service.get("volumes"), named),
     )
+
+
+def _command(where: str, value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return tuple(shlex.split(value))
+    return tuple(str(c) for c in _sequence(where, value))
 
 
 def _build(value: Any) -> Build:
@@ -289,12 +312,13 @@ def _healthcheck(where: str, value: Any) -> Healthcheck | None:
 
 
 def _port(key: str, value: Any) -> Port:
-    start, sep, end = key.partition("-")
-    if not (start.isdigit() and (not sep or end.isdigit())):
+    service, named, span = key.rpartition(":")
+    start, sep, end = span.partition("-")
+    if not (start.isdigit() and (not sep or end.isdigit())) or (named and not service):
         raise ValueError(f"port {key!r} is neither a port nor a range")
     if not isinstance(value, dict) or "env" not in value:
         raise ValueError(f"port {key!r} needs {{env: VAR}}")
-    return Port(int(start), int(end or start), str(value["env"]))
+    return Port(int(start), int(end or start), str(value["env"]), service)
 
 
 def _check_host(host: str) -> None:

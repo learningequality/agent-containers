@@ -136,6 +136,51 @@ def test_fresh_rebuilds_the_image_of_a_running_instance(tmp_path, monkeypatch, f
     assert len(built) == builds
 
 
+SIDECAR_PORTS = """
+services:
+  app:
+    build: .
+    x-agent:
+      ports:
+        "8000": {env: APP_PORT}
+        "gcs:4443": {env: GCS_PUBLIC_PORT}
+  gcs:
+    image: fsouza/fake-gcs-server:1.55.1
+"""
+
+
+class _LabelledRuntime(runtime.Runtime):
+    def __init__(self, labels):
+        super().__init__("podman")
+        self.target_labels = labels
+
+    def labelled(self, kind, labels):
+        return [runtime.Resource("ac-x-app", self.target_labels, "running")]
+
+
+def test_a_running_targets_sidecar_ports_are_reused_and_served(tmp_path):
+    given = {8000: 30000, "gcs:4443": 31000}
+    spec = instance.make_spec(runtime.Runtime("podman"), parse(SIDECAR_PORTS), "app", tmp_path, "img", host_ports=given)
+    rt = _LabelledRuntime(spec.labels("target"))
+    found = instance.make_spec(rt, parse(SIDECAR_PORTS), "app", tmp_path, "img")
+    assert found.host_ports == given
+    assert instance.Instance(rt, found)._reusable()
+    assert instance.Instance(rt, found).urls() == {8000: "http://127.0.0.1:30000", "gcs:4443": "http://127.0.0.1:31000"}
+
+
+def test_spec_rejects_given_ports_that_miss_a_sidecar_port(tmp_path):
+    declaration = parse(SIDECAR_PORTS)
+    with pytest.raises(ToolError, match="gcs:4443"):
+        instance.make_spec(runtime.Runtime("podman"), declaration, "app", tmp_path, "img", host_ports={8000: 1})
+
+
+@pytest.mark.parametrize("given", [{8000: 3128, "gcs:4443": 31000}, {8000: 30000, "gcs:4443": 3128}])
+def test_spec_rejects_a_host_port_the_gateway_proxy_listens_on(tmp_path, given):
+    declaration = parse(SIDECAR_PORTS)
+    with pytest.raises(ToolError, match="3128 is the gateway's proxy"):
+        instance.make_spec(runtime.Runtime("podman"), declaration, "app", tmp_path, "img", host_ports=given)
+
+
 def test_spec_rejects_given_ports_that_miss_a_declared_one(tmp_path):
     with pytest.raises(ToolError, match="4000"):
         instance.make_spec(runtime.Runtime("podman"), parse(COMPOSE), "app", tmp_path, "img", host_ports={8000: 1})

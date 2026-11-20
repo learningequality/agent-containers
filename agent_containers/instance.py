@@ -20,6 +20,7 @@ from pathlib import Path
 
 from agent_containers import images
 from agent_containers.config import home
+from agent_containers.declaration import PROXY_PORT
 from agent_containers.declaration import SERVE
 from agent_containers.declaration import Build
 from agent_containers.declaration import Declaration
@@ -68,7 +69,7 @@ _NO_REDIRECTS = urllib.request.build_opener(_Unredirected, urllib.request.ProxyH
 
 @dataclass(frozen=True)
 class Served:
-    urls: dict[int, str]
+    urls: dict[int | str, str]
     log: str
 
 
@@ -98,7 +99,7 @@ def make_spec(
     image: str,
     *,
     instance: str | None = None,
-    host_ports: dict[int, int] | None = None,
+    host_ports: dict[int | str, int] | None = None,
     namespace: str | None = None,
     git_dirs: tuple[Path, ...] | None = None,
 ) -> Spec:
@@ -107,9 +108,12 @@ def make_spec(
     ports_given = host_ports is not None
     if host_ports is None:
         host_ports = _running_ports(runtime, names, chosen.ports) or reserve_host_ports(chosen.ports)
-    missing = [port.start for port in chosen.ports if port.start not in host_ports]
+    missing = [port.key for port in chosen.ports if port.key not in host_ports]
     if missing:
         raise ToolError(f"no host port given for {', '.join(map(str, missing))}")
+    proxied = [port.key for port in chosen.ports if 0 <= PROXY_PORT - host_ports[port.key] < port.count]
+    if proxied:
+        raise ToolError(f"host port {PROXY_PORT} is the gateway's proxy; give {', '.join(map(str, proxied))} another")
     mount = chosen.working_dir or DEFAULT_WORKDIR
     return Spec(
         names=names,
@@ -133,7 +137,7 @@ def prepare(
     repo: str | None = None,
     local: bool = False,
     instance: str | None = None,
-    host_ports: dict[int, int] | None = None,
+    host_ports: dict[int | str, int] | None = None,
     namespace: str | None = None,
     git_dirs: tuple[Path, ...] | None = None,
     fresh: bool = False,
@@ -178,16 +182,17 @@ def _target_container(runtime: Runtime, names: Names) -> Resource | None:
     return found[0] if found else None
 
 
-def _ports_of(container: Resource | None) -> dict[int, int]:
+def _ports_of(container: Resource | None) -> dict[int | str, int]:
     try:
-        return {int(k): int(v) for k, v in json.loads(container.labels.get(LABEL_PORTS, "{}")).items()}
+        labelled = json.loads(container.labels.get(LABEL_PORTS, "{}")).items()
+        return {int(k) if k.isdigit() else k: int(v) for k, v in labelled}
     except (AttributeError, ValueError):
         return {}
 
 
-def _running_ports(runtime: Runtime, names: Names, declared: tuple) -> dict[int, int] | None:
+def _running_ports(runtime: Runtime, names: Names, declared: tuple) -> dict[int | str, int] | None:
     ports = _ports_of(_target_container(runtime, names))
-    return ports if ports and set(ports) == {port.start for port in declared} else None
+    return ports if ports and set(ports) == {port.key for port in declared} else None
 
 
 def lock_dir() -> Path:
@@ -208,8 +213,8 @@ def lock_dir() -> Path:
 def probe_url(spec: Spec) -> str:
     ready = spec.target.ready
     assert ready is not None and ready.port
-    port = next(p for p in spec.target.ports if p.covers(ready.port))
-    return f"http://127.0.0.1:{spec.host_ports[port.start] + ready.port - port.start}{ready.path}"
+    port = next(p for p in spec.target.own_ports if p.covers(ready.port))
+    return f"http://127.0.0.1:{spec.host_ports[port.key] + ready.port - port.start}{ready.path}"
 
 
 class Instance:
@@ -313,8 +318,8 @@ class Instance:
             self._wait_served()
         return served
 
-    def urls(self) -> dict[int, str]:
-        return {port.start: f"http://127.0.0.1:{self.spec.host_ports[port.start]}" for port in self.spec.target.ports}
+    def urls(self) -> dict[int | str, str]:
+        return {port.key: f"http://127.0.0.1:{self.spec.host_ports[port.key]}" for port in self.spec.target.ports}
 
     def stop(self, *, purge: bool = False) -> None:
         with self._lock():

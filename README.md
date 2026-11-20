@@ -62,6 +62,9 @@ services:
   db:
     image: postgres:16
     healthcheck: {test: ["CMD-SHELL", "pg_isready"], interval: 2s, retries: 30}
+  gcs:
+    image: fsouza/fake-gcs-server:1.55.1
+    command: -scheme http
   web:
     build: {context: ., target: dev}
     environment:
@@ -74,6 +77,7 @@ services:
       ports:
         "8000": {env: PUBLIC_PORT}
         "4000-4100": {env: WEBPACK_DEV_PUBLIC_PORT}
+        "gcs:4443": {env: GCS_PUBLIC_PORT}
       state: /kolibri
       ready: {path: /, port: 8000, timeout: 900}
 ```
@@ -82,7 +86,7 @@ services:
 |---|---|
 | `commands` | Named commands for your `AGENTS.md`; `serve` is reserved. Any command may run. |
 | `hosts` | The only hosts the target reaches, on ports 80 and 443. `*.example.org` matches subdomains only. |
-| `ports` | Container ports published on `127.0.0.1`. The target gets each one's host port in `env`; a range gets consecutive host ports and the first one. |
+| `ports` | Container ports published on `127.0.0.1`. The target gets each one's host port in `env`; a range gets consecutive host ports and the first one. `sidecar:port` publishes a sidecar's port. |
 | `state` | A container path kept in a volume across restarts until `stop --purge`. |
 | `ready` | When `serve` is up: `path` and `port` answering below 500, or `command` exiting 0; within `timeout` seconds. |
 | `devices` | `[kvm]` mounts `/dev/kvm` on Linux. |

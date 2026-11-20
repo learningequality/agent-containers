@@ -93,7 +93,7 @@ class Spec:
     target: Target
     image: str
     sidecars: tuple[Sidecar, ...] = ()
-    host_ports: dict[int, int] = field(default_factory=dict)
+    host_ports: dict[int | str, int] = field(default_factory=dict)
     denied: tuple[Network, ...] = ()
     git_mounts: tuple[tuple[str, str], ...] = ()
     ports_given: bool = True
@@ -106,30 +106,32 @@ class Spec:
             LABEL_ROLE: role,
         }
         if role == "target":
-            labels[LABEL_PORTS] = json.dumps({str(k): v for k, v in sorted(self.host_ports.items())})
+            ports = sorted((str(k), v) for k, v in self.host_ports.items())
+            labels[LABEL_PORTS] = json.dumps(dict(ports))
         return labels
+
+    def port_environment(self) -> dict[str, str]:
+        return {port.env: str(self.host_ports[port.key]) for port in self.target.ports}
 
     def environment(self, proxy_ip: str) -> dict[str, str]:
         proxy = f"http://{proxy_ip}:{PROXY_PORT}"
         no_proxy = ",".join(["localhost", "127.0.0.1", self.target.name, *(s.name for s in self.sidecars)])
-        env = dict(self.target.environment)
-        for port in self.target.ports:
-            env[port.env] = str(self.host_ports[port.start])
+        env = {**self.target.environment, **self.port_environment()}
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
             env[key] = proxy
         env["NO_PROXY"] = env["no_proxy"] = no_proxy
         return env
 
-    def forwards(self) -> list[tuple[int, int]]:
+    def forwards(self) -> list[tuple[int, str, int]]:
         return [
-            (self.host_ports[port.start] + offset, port.start + offset)
+            (self.host_ports[port.key] + offset, port.service or self.target.name, port.start + offset)
             for port in self.target.ports
             for offset in range(port.count)
         ]
 
 
-def reserve_host_ports(ports: tuple[Port, ...], *, attempts: int = 50) -> dict[int, int]:
-    reserved: dict[int, int] = {}
+def reserve_host_ports(ports: tuple[Port, ...], *, attempts: int = 50) -> dict[int | str, int]:
+    reserved: dict[int | str, int] = {}
     held: list[socket.socket] = []
     try:
         for port in ports:
@@ -137,7 +139,7 @@ def reserve_host_ports(ports: tuple[Port, ...], *, attempts: int = 50) -> dict[i
                 block = _bind_block(port.count)
                 if block:
                     held.extend(block)
-                    reserved[port.start] = block[0].getsockname()[1]
+                    reserved[port.key] = block[0].getsockname()[1]
                     break
             else:
                 raise ToolError(f"no {port.count} consecutive free loopback ports for {port.start}-{port.end}")
@@ -396,11 +398,15 @@ class Runtime:
         ]
 
     def gateway_args(self, spec: Spec, addresses: Addresses) -> list[str]:
-        publishes = [item for host, port in spec.forwards() for item in ("--publish", f"127.0.0.1:{host}:{port}")]
+        forwards = spec.forwards()
+        publishes = [item for host, _, _ in forwards for item in ("--publish", f"127.0.0.1:{host}:{host}")]
         allow = [item for host in spec.target.hosts for item in ("--allow", host)]
         deny = [item for network in spec.denied for item in ("--deny", str(network))]
-        target_ip = addresses.services[spec.target.name]
-        forward = [item for _, port in spec.forwards() for item in ("--forward", f"{port}:{target_ip}:{port}")]
+        forward = [
+            item
+            for host, service, port in forwards
+            for item in ("--forward", f"{host}:{addresses.services[service]}:{port}")
+        ]
         return [
             "create",
             "--name",
