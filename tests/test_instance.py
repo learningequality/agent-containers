@@ -207,14 +207,23 @@ class _Claiming(runtime.Runtime):
         super().__init__("docker")
         self.existing = existing
         self.claimed = {}
+        self.calls = []
+        self.removed_volumes = []
 
     def labelled(self, kind, labels):
         return [runtime.Resource(name, {}) for name in self.existing] if kind == "volume" else []
 
+    def exists(self, kind, name):
+        return name in self.existing
+
     def remove(self, labels, *, volumes):
         pass
 
+    def remove_volumes(self, names):
+        self.removed_volumes.extend(names)
+
     def run(self, args, **kwargs):
+        self.calls.append(args)
         return subprocess.CompletedProcess(args, 0, "", "")
 
     def create_network(self, spec):
@@ -230,7 +239,7 @@ class _Claiming(runtime.Runtime):
         pass
 
     def claim_volume(self, image, volume, path):
-        self.claimed[volume] = path
+        self.claimed[volume] = (image, path)
 
 
 def _claims(tmp_path, monkeypatch, existing_names=()):
@@ -244,12 +253,133 @@ def _claims(tmp_path, monkeypatch, existing_names=()):
 
 def test_up_hands_only_the_targets_new_volumes_to_the_user(tmp_path, monkeypatch):
     claimed, names = _claims(tmp_path, monkeypatch)
-    assert claimed == {names.volume("cache"): "/cache", names.state: "/state"}
+    assert claimed == {names.volume("cache"): ("img", "/cache"), names.state: ("img", "/state")}
 
 
 def test_up_leaves_a_volume_that_already_exists_alone(tmp_path, monkeypatch):
     claimed, names = _claims(tmp_path, monkeypatch, existing_names=("state",))
-    assert claimed == {names.volume("cache"): "/cache"}
+    assert claimed == {names.volume("cache"): ("img", "/cache")}
+
+
+SHARED = """
+services:
+  db:
+    image: postgres:16
+    volumes: [pgdata:/var/lib/postgresql/data]
+  lod:
+    image: kolibri:web
+    volumes: [lodhome:/lod]
+  app:
+    build: .
+    x-agent:
+      cache: /template
+      worktree_sidecars: [lod]
+volumes:
+  pgdata:
+  lodhome:
+"""
+
+
+def _shared(tmp_path, monkeypatch, rt, **kwargs):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    spec = instance.make_spec(
+        rt, parse(SHARED), "app", tmp_path, "img", instance="shared", host_ports={}, repo="org/repo", **kwargs
+    )
+    return instance.Instance(rt, spec)
+
+
+def test_up_creates_the_cache_unlabelled_by_instance_and_hands_it_and_worktree_sidecar_volumes_over(
+    tmp_path, monkeypatch
+):
+    rt = _Claiming()
+    inst = _shared(tmp_path, monkeypatch, rt)
+    inst.up(fresh=True)
+    cache = inst.spec.cache
+    created = next(call for call in rt.calls if call[:2] == ["volume", "create"] and call[-1] == cache)
+    assert runtime.flags("--label", inst.spec.cache_labels()) == created[2:-1]
+    lodhome = inst.spec.names.volume("lodhome")
+    assert rt.claimed == {cache: ("img", "/template"), lodhome: ("docker.io/library/kolibri:web", "/lod")}
+
+
+def test_an_existing_cache_is_neither_created_nor_handed_over(tmp_path, monkeypatch):
+    rt = _Claiming()
+    inst = _shared(tmp_path, monkeypatch, rt)
+    rt.existing = (inst.spec.cache,)
+    inst.up(fresh=True)
+    assert not [call for call in rt.calls if call[:2] == ["volume", "create"] and call[-1] == inst.spec.cache]
+    assert inst.spec.cache not in rt.claimed
+
+
+class _FailingTarget(_Claiming):
+    def start_target(self, spec, addresses):
+        raise ToolError("target broke")
+
+
+def test_a_failed_up_removes_the_volumes_it_created_but_never_the_cache(tmp_path, monkeypatch):
+    rt = _FailingTarget()
+    inst = _shared(tmp_path, monkeypatch, rt)
+    with pytest.raises(ToolError, match="target broke"):
+        inst.up(fresh=True)
+    assert inst.spec.names.volume("lodhome") in rt.removed_volumes
+    assert inst.spec.cache not in rt.removed_volumes
+
+
+SCOPED = """
+services:
+  web:
+    build: .
+    depends_on: {lod: {condition: service_started}}
+    x-agent: {}
+  server:
+    build: .
+    x-agent: {}
+  lod:
+    image: kolibri:web
+    volumes: [lodhome:/lod]
+  db:
+    image: postgres:16
+    volumes: [pgdata:/var/lib/postgresql/data]
+volumes:
+  lodhome:
+  pgdata:
+"""
+
+
+def test_a_target_starts_and_names_only_the_sidecars_it_depends_on(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    rt = _Claiming()
+    started = []
+    monkeypatch.setattr(rt, "start_sidecar", lambda spec, sidecar, addresses: started.append(sidecar.name))
+    spec = instance.make_spec(rt, parse(SCOPED), "web", tmp_path, "img", host_ports={})
+    instance.Instance(rt, spec).up(fresh=True)
+
+    assert started == ["lod"]
+    assert set(runtime.layout("10.89.0.0/24", spec).services) == {"web", "lod"}
+    assert spec.environment("10.89.0.2")["NO_PROXY"] == "localhost,127.0.0.1,web,lod"
+    created = [call[-1] for call in rt.calls if call[:2] == ["volume", "create"]]
+    assert created == [spec.names.volume("lodhome")]
+    server = instance.make_spec(rt, parse(SCOPED), "server", tmp_path, "img", host_ports={})
+    assert [s.name for s in server.sidecars] == ["lod", "db"]
+
+
+def test_a_cache_needs_a_repo_to_be_named_by(tmp_path):
+    with pytest.raises(ToolError, match="cache"):
+        instance.make_spec(runtime.Runtime("podman"), parse(SHARED), "app", tmp_path, "img", host_ports={})
+
+
+def test_a_local_instance_keys_its_cache_on_the_worktree(tmp_path, monkeypatch):
+    (tmp_path / "docker-compose.yml").write_text(SHARED)
+    monkeypatch.setattr(instance, "_build_local", lambda *args: None)
+    built = instance.prepare(tmp_path, "app", runtime=_RunningRuntime("podman"), local=True)
+    assert built.spec.repo == f"local:{tmp_path.resolve()}"
+
+
+def test_status_names_the_cache_volume_of_a_running_target(tmp_path):
+    spec = instance.make_spec(
+        runtime.Runtime("podman"), parse(SHARED), "app", tmp_path, "img", host_ports={}, repo="org/repo"
+    )
+    target = runtime.Resource("ac-x-app", spec.labels("target"), "running")
+    assert instance.status_lines([target]) == ["app\ttarget\trunning\tac-x-app", f"app\tcache\tvolume\t{spec.cache}"]
 
 
 SERVING = """

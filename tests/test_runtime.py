@@ -263,6 +263,112 @@ def test_the_worktree_mount_is_shared_between_instances(tmp_path, monkeypatch, n
     assert worktree.endswith(":z")
 
 
+WORKTREE_SIDECAR = """
+services:
+  web:
+    build: .
+    working_dir: /kolibri
+    x-agent:
+      worktree_sidecars: [lod]
+      cache: /cache
+      ports:
+        "lod:8081": {env: LOD_PUBLIC_PORT}
+  lod:
+    image: ghcr.io/learningequality/kolibri/web:default
+    environment: {KOLIBRI_HOME: /lod}
+    command: kolibri start --port 8081
+    volumes: [lodhome:/lod]
+  db:
+    image: postgres:16
+volumes:
+  lodhome:
+"""
+
+
+def _worktree_spec(tmp_path, **overrides):
+    fields = dict(
+        compose=WORKTREE_SIDECAR,
+        mount="/kolibri",
+        host_ports={"lod:8081": 30000},
+        git_mounts=((str(tmp_path / ".git"), "/kolibri/.git"),),
+        repo="learningequality/kolibri",
+    )
+    return _spec(tmp_path, **{**fields, **overrides})
+
+
+def _sidecar(spec, name):
+    return next(sidecar for sidecar in spec.sidecars if sidecar.name == name)
+
+
+@pytest.mark.parametrize("name", ["podman", "docker"])
+def test_a_worktree_sidecar_is_mounted_and_run_as_the_target_is(tmp_path, monkeypatch, name):
+    monkeypatch.setattr(runtime.sys, "platform", "linux")
+    rt = runtime.Runtime(name)
+    rt._rootless = False
+    spec = _worktree_spec(tmp_path)
+    addresses = _addresses(spec)
+    target = rt.target_args(spec, addresses)
+    lod = rt.sidecar_args(spec, _sidecar(spec, "lod"), addresses)
+    target_volumes = set(_values(target, "--volume"))
+    lod_volumes = set(_values(lod, "--volume"))
+
+    assert {f"{tmp_path}:/kolibri:z", f"{tmp_path}/.git:/kolibri/.git:ro,z"} <= target_volumes & lod_volumes
+    assert "ac-default-abc123-lodhome:/lod" in lod_volumes
+    assert not {v for v in lod_volumes if v.endswith(":/cache")}
+    assert rt.user_args() and set(rt.user_args()) <= set(lod)
+    assert {"--cap-drop=ALL", "--init"} <= set(lod)
+    assert _values(lod, "--workdir") == ["/kolibri"]
+    assert lod[-5:] == ["ghcr.io/learningequality/kolibri/web:default", "kolibri", "start", "--port", "8081"]
+    assert _values(lod, "--network") == [spec.names.network]
+    assert "HTTPS_PROXY" not in " ".join(_values(lod, "--env"))
+
+
+def test_a_plain_sidecar_gets_neither_the_worktree_nor_the_invoking_user(tmp_path):
+    rt = runtime.Runtime("podman")
+    spec = _worktree_spec(tmp_path)
+    db = rt.sidecar_args(spec, _sidecar(spec, "db"), _addresses(spec))
+    assert _values(db, "--volume") == []
+    assert not {"--userns=keep-id", "--workdir", "--cap-drop=ALL"} & set(db)
+
+
+def test_a_worktree_sidecars_port_is_forwarded_to_it(tmp_path):
+    spec = _worktree_spec(tmp_path)
+    addresses = _addresses(spec)
+    argv = runtime.Runtime("podman").gateway_args(spec, addresses)
+    assert _values(argv, "--forward") == [f"30000:{addresses.services['lod']}:8081"]
+    assert spec.environment(PROXY_IP)["LOD_PUBLIC_PORT"] == "30000"
+
+
+def test_the_cache_is_mounted_in_the_target_from_one_volume_per_repo_and_target(tmp_path):
+    spec = _worktree_spec(tmp_path)
+    other_instance = _worktree_spec(tmp_path, names=runtime.Names("default", "def456"))
+    volumes = _values(runtime.Runtime("podman").target_args(spec, _addresses(spec)), "--volume")
+
+    assert f"{spec.cache}:/cache" in volumes
+    assert spec.cache == other_instance.cache
+    assert spec.cache.startswith("ac-default-cache-kolibri-web-")
+    assert spec.cache == _worktree_spec(tmp_path, repo="LearningEquality/Kolibri").cache
+    assert spec.cache != _worktree_spec(tmp_path, names=runtime.Names("other", "abc123")).cache
+    assert _worktree_spec(tmp_path, repo="a-b/c").cache != _worktree_spec(tmp_path, repo="a/b-c").cache
+    assert spec.labels("target")[runtime.LABEL_CACHE] == spec.cache
+
+
+def test_cache_labels_name_no_instance_or_worktree(tmp_path):
+    labels = _worktree_spec(tmp_path).cache_labels()
+    assert labels == {
+        runtime.LABEL_NAMESPACE: "default",
+        runtime.LABEL_REPO: "learningequality/kolibri",
+        runtime.LABEL_TARGET: "web",
+        runtime.LABEL_ROLE: "cache",
+    }
+
+
+def test_a_target_without_a_cache_mounts_none(tmp_path):
+    spec = _spec(tmp_path)
+    assert spec.cache == ""
+    assert runtime.LABEL_CACHE not in spec.labels("target")
+
+
 class _Recorded:
     def __init__(self, stdout=""):
         self.calls = []

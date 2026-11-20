@@ -29,7 +29,7 @@ agent-containers run -- make test             # the repo's only target
 agent-containers run web -- pnpm test-jest    # a named target
 agent-containers serve web                    # start `serve`, print its URLs and log path
 agent-containers status                       # this worktree's containers
-agent-containers stop [web] [--purge]         # stop; --purge also drops volumes
+agent-containers stop [web] [--purge]         # stop; --purge also drops volumes but `cache`
 agent-containers reap                         # remove instances whose worktree was deleted
 ```
 
@@ -55,7 +55,7 @@ The service fixes the repo, runtime and namespace, so `--local`, `--repo`, `--ru
 
 ## Declaring targets
 
-Each service with an `x-agent` block in your default branch's `docker-compose.yml` is a target; every other service is a sidecar the target reaches by its service name.
+Each service with an `x-agent` block in your default branch's `docker-compose.yml` is a target; every other service is a sidecar the target reaches by its service name. A target starts the sidecars its `depends_on` names, else every sidecar.
 
 ```yaml
 services:
@@ -88,6 +88,8 @@ services:
 | `hosts` | The only hosts the target reaches, on ports 80 and 443. `*.example.org` matches subdomains only. |
 | `ports` | Container ports published on `127.0.0.1`. The target gets each one's host port in `env`; a range gets consecutive host ports and the first one. `sidecar:port` publishes a sidecar's port. |
 | `state` | A container path kept in a volume across restarts until `stop --purge`. |
+| `cache` | A container path in one volume shared by every instance of this repo's target. Nothing the tool does removes it: `status` prints its name while the target runs; stop, then `podman volume rm <name>`. |
+| `worktree_sidecars` | Sidecars that get the worktree, git dirs, user and working directory the target gets. |
 | `ready` | When `serve` is up: `path` and `port` answering below 500, or `command` exiting 0; within `timeout` seconds. |
 | `devices` | `[kvm]` mounts `/dev/kvm` on Linux. |
 

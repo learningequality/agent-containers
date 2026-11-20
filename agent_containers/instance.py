@@ -6,7 +6,6 @@ import fcntl
 import hashlib
 import json
 import os
-import re
 import shlex
 import stat
 import subprocess
@@ -32,6 +31,7 @@ from agent_containers.images import select
 from agent_containers.layout import IGNORE_ALL
 from agent_containers.layout import STATE_DIR
 from agent_containers.runtime import DEFAULT_WORKDIR
+from agent_containers.runtime import LABEL_CACHE
 from agent_containers.runtime import LABEL_INSTANCE
 from agent_containers.runtime import LABEL_NAMESPACE
 from agent_containers.runtime import LABEL_PORTS
@@ -48,7 +48,9 @@ from agent_containers.runtime import flags
 from agent_containers.runtime import git_mounts
 from agent_containers.runtime import host_networks
 from agent_containers.runtime import namespace as current_namespace
+from agent_containers.runtime import qualified
 from agent_containers.runtime import reserve_host_ports
+from agent_containers.runtime import safe
 
 UP_TIMEOUT = 900
 SIDECAR_TIMEOUT = 300
@@ -56,7 +58,6 @@ POLL_INTERVAL = 1.0
 ERROR_BODY_LIMIT = 4096
 KILL_GRACE = 3
 PIDFILE_WAIT = 10
-_UNSAFE = re.compile(r"[^a-z0-9]+")
 
 
 class _Unredirected(urllib.request.HTTPRedirectHandler):
@@ -78,17 +79,17 @@ def served_lines(served: Served) -> list[str]:
 
 
 def status_lines(containers: list[Resource]) -> list[str]:
-    return [
-        f"{c.labels.get(LABEL_TARGET, '?')}\t{c.labels.get(LABEL_ROLE, '?')}\t{c.state}\t{c.name}" for c in containers
-    ]
+    lines = []
+    for c in containers:
+        target = c.labels.get(LABEL_TARGET, "?")
+        lines.append(f"{target}\t{c.labels.get(LABEL_ROLE, '?')}\t{c.state}\t{c.name}")
+        if c.labels.get(LABEL_CACHE):
+            lines.append(f"{target}\tcache\tvolume\t{c.labels[LABEL_CACHE]}")
+    return lines
 
 
 def instance_id(worktree: Path, target: str) -> str:
     return hashlib.sha256(f"{worktree.resolve()}\0{target}".encode()).hexdigest()[:12]
-
-
-def _safe(name: str) -> str:
-    return _UNSAFE.sub("-", name.lower()).strip("-") or "x"
 
 
 def make_spec(
@@ -102,9 +103,12 @@ def make_spec(
     host_ports: dict[int | str, int] | None = None,
     namespace: str | None = None,
     git_dirs: tuple[Path, ...] | None = None,
+    repo: str = "",
 ) -> Spec:
     chosen = declaration.targets[target]
-    names = Names(_safe(namespace or current_namespace()), _safe(instance or instance_id(worktree, target)))
+    if chosen.cache and not repo:
+        raise ToolError(f"target {target!r} declares a cache, which needs the repo it belongs to")
+    names = Names(safe(namespace or current_namespace()), safe(instance or instance_id(worktree, target)))
     ports_given = host_ports is not None
     if host_ports is None:
         host_ports = _running_ports(runtime, names, chosen.ports) or reserve_host_ports(chosen.ports)
@@ -121,11 +125,12 @@ def make_spec(
         mount=mount,
         target=chosen,
         image=image,
-        sidecars=tuple(declaration.sidecars.values()),
+        sidecars=declaration.sidecars_of(target),
         host_ports=dict(host_ports),
         denied=host_networks(),
         git_mounts=git_mounts(worktree, mount, git_dirs),
         ports_given=ports_given,
+        repo=repo,
     )
 
 
@@ -145,9 +150,11 @@ def prepare(
     if local:
         declaration = load(worktree / COMPOSE_FILE)
         chosen = select(declaration, target, str(worktree))
-        image = f"localhost/agent-containers-local/{_safe(worktree.name)}-{chosen}:latest"
+        image = f"localhost/agent-containers-local/{safe(worktree.name)}-{chosen}:latest"
+        repo = f"local:{worktree.resolve()}"
     else:
-        resolved = images.resolve(repo or images.repo_of(worktree), target)
+        repo = repo or images.repo_of(worktree)
+        resolved = images.resolve(repo, target)
         declaration, chosen, image = resolved.declaration, resolved.target, resolved.image
     spec = make_spec(
         runtime,
@@ -159,6 +166,7 @@ def prepare(
         host_ports=host_ports,
         namespace=namespace,
         git_dirs=git_dirs,
+        repo=repo,
     )
     built = Instance(runtime, spec)
     if fresh or not runtime.running(built.container):
@@ -249,9 +257,10 @@ class Instance:
             self.runtime.remove(self.labels, volumes=False)
             created = self._ensure_volumes()
             try:
-                for volume, path in self._target_volumes().items():
+                for volume, (image, path) in self._claimed_volumes().items():
                     if volume in created:
-                        self.runtime.claim_volume(self.spec.image, volume, path)
+                        self.runtime.claim_volume(image, volume, path)
+                self._ensure_cache()
                 addresses = self.runtime.create_network(self.spec)
                 self.runtime.start_gateway(self.spec, addresses)
                 for sidecar in self.spec.sidecars:
@@ -339,11 +348,36 @@ class Instance:
         exec_args = self.runtime.exec_args(self.container, argv, workdir=self.spec.mount, interactive="input" in kwargs)
         return self.runtime.run(exec_args, what=what, check=False, **kwargs)
 
-    def _target_volumes(self) -> dict[str, str]:
-        mounted = {self.spec.names.volume(v.name): v.path for v in self.spec.target.volumes}
+    def _claimed_volumes(self) -> dict[str, tuple[str, str]]:
+        claimed = {
+            self.spec.names.volume(v.name): (qualified(sidecar.image), v.path)
+            for sidecar in self.spec.sidecars
+            if self.spec.shares_worktree(sidecar)
+            for v in sidecar.volumes
+        }
+        claimed.update({self.spec.names.volume(v.name): (self.spec.image, v.path) for v in self.spec.target.volumes})
         if self.spec.target.state:
-            mounted[self.spec.names.state] = self.spec.target.state
-        return mounted
+            claimed[self.spec.names.state] = (self.spec.image, self.spec.target.state)
+        return claimed
+
+    def _ensure_cache(self) -> None:
+        cache = self.spec.cache
+        if not cache:
+            return
+        with _flock(f"{cache}.lock"):
+            if self.runtime.exists("volume", cache):
+                return
+            labels = flags("--label", self.spec.cache_labels())
+            made = self.runtime.run(["volume", "create", *labels, cache], what="create volume", check=False)
+            if made.returncode != 0:
+                if not self.runtime.exists("volume", cache):
+                    raise ToolError(f"create volume {cache} failed: {made.stderr.strip()[-LOG_TAIL:]}")
+                return
+            try:
+                self.runtime.claim_volume(self.spec.image, cache, self.spec.target.cache)
+            except BaseException:
+                self.runtime.run(["volume", "rm", cache], what="remove volume", check=False)
+                raise
 
     def _ensure_volumes(self) -> list[str]:
         wanted = {volume.name for sidecar in self.spec.sidecars for volume in sidecar.volumes}
@@ -442,19 +476,22 @@ class Instance:
     def _tail(self) -> str:
         return self._exec(["tail", "-c", str(LOG_TAIL), self.log], what="read serve log").stdout
 
-    @contextlib.contextmanager
-    def _lock(self, purpose: str = "up") -> Iterator[None]:
-        name = f"{self.spec.names.prefix}.{purpose}.lock"
-        fd = os.open(lock_dir() / name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            os.close(fd)
+    def _lock(self, purpose: str = "up") -> contextlib.AbstractContextManager[None]:
+        return _flock(f"{self.spec.names.prefix}.{purpose}.lock")
+
+
+@contextlib.contextmanager
+def _flock(name: str) -> Iterator[None]:
+    fd = os.open(lock_dir() / name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def _pidfile(group: str) -> str:
-    return f"/tmp/.agent-containers-{_safe(group)}.pid"
+    return f"/tmp/.agent-containers-{safe(group)}.pid"
 
 
 def deleted_instances(runtime: Runtime, ns: str, roots: list[Path] | None = None) -> set[str]:

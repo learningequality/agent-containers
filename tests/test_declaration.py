@@ -297,6 +297,109 @@ def test_ready_probes_only_the_targets_own_ports():
         parse(text)
 
 
+WORKTREE_SIDECARS = """
+services:
+  app:
+    build: .
+    x-agent:
+      worktree_sidecars: {names}
+      cache: {cache}
+  other:
+    build: .
+    x-agent: {{}}
+  lod:
+    image: ghcr.io/learningequality/kolibri/web:default
+  db:
+    image: postgres:16
+"""
+
+
+def test_worktree_sidecars_and_cache_parse():
+    target = parse(WORKTREE_SIDECARS.format(names="[lod]", cache="/cache")).targets["app"]
+    assert (target.worktree_sidecars, target.cache) == (("lod",), "/cache")
+
+
+@pytest.mark.parametrize(
+    ("names", "cache", "named"),
+    [
+        ("[web]", "/cache", "target 'app': worktree_sidecars 'web' names no sidecar (sidecars: db, lod)"),
+        ("[other]", "/cache", "target 'app': worktree_sidecars 'other' names no sidecar (sidecars: db, lod)"),
+        ("[app]", "/cache", "target 'app': worktree_sidecars 'app' names the target itself"),
+        ("lod", "/cache", "target 'app': worktree_sidecars is not a list"),
+        ("[lod]", "cache", "target 'app': cache 'cache' is not an absolute path"),
+    ],
+)
+def test_a_bad_worktree_sidecar_or_cache_fails(names, cache, named):
+    with pytest.raises(ValueError, match=re.escape(named)):
+        parse(WORKTREE_SIDECARS.format(names=names, cache=cache))
+
+
+DEPENDS_ON = """
+services:
+  web:
+    build: .
+    {depends_on}
+    x-agent:
+      {agent}
+  server:
+    build: .
+    x-agent: {{}}
+  lod:
+    image: kolibri:web
+  db:
+    image: postgres:16
+  redis:
+    image: redis:7
+"""
+
+
+@pytest.mark.parametrize(
+    ("depends_on", "scoped"),
+    [
+        ("depends_on: [lod]", ("lod",)),
+        ("depends_on: {lod: {condition: service_started}, db: {condition: service_healthy}}", ("lod", "db")),
+        ("depends_on: []", ()),
+        ("depends_on: [server]", ("server",)),
+        ("", None),
+    ],
+)
+def test_depends_on_takes_the_list_or_mapping_form_and_absent_means_every_sidecar(depends_on, scoped):
+    declaration = parse(DEPENDS_ON.format(depends_on=depends_on, agent=""))
+    assert declaration.targets["web"].depends_on == scoped
+    assert declaration.targets["server"].depends_on is None
+    expected = ("lod", "db", "redis") if scoped is None else tuple(n for n in ("lod", "db", "redis") if n in scoped)
+    assert tuple(s.name for s in declaration.sidecars_of("web")) == expected
+    assert tuple(s.name for s in declaration.sidecars_of("server")) == ("lod", "db", "redis")
+
+
+@pytest.mark.parametrize(
+    ("depends_on", "agent", "named"),
+    [
+        ("depends_on: [nginx]", "", "target 'web': depends_on 'nginx' names no service"),
+        ("depends_on: [web]", "", "target 'web': depends_on 'web' names the target itself"),
+        (
+            "depends_on: [server, lod]",
+            'ports: {"server:9000": {env: SERVER_PORT}}',
+            "target 'web': port 'server:9000' names no sidecar in depends_on (depends_on: lod)",
+        ),
+        ("depends_on: lod", "", "target 'web': depends_on is neither a list nor a mapping"),
+        (
+            "depends_on: [lod]",
+            "worktree_sidecars: [db]",
+            "target 'web': worktree_sidecars 'db' names no sidecar in depends_on (depends_on: lod)",
+        ),
+        (
+            "depends_on: [lod]",
+            'ports: {"redis:6379": {env: REDIS_PORT}}',
+            "target 'web': port 'redis:6379' names no sidecar in depends_on (depends_on: lod)",
+        ),
+    ],
+)
+def test_depends_on_names_sidecars_and_bounds_ports_and_worktree_sidecars(depends_on, agent, named):
+    with pytest.raises(ValueError, match=re.escape(named)):
+        parse(DEPENDS_ON.format(depends_on=depends_on, agent=agent))
+
+
 def test_a_compose_without_targets_ignores_services_it_cannot_run():
     undeclared = (FIXTURES / "kdp-compose.yml").read_text().split("    x-agent:")[0]
     declaration = parse(undeclared + "volumes:\n  kdp-postgres:\n")
