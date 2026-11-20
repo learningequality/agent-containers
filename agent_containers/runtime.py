@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import ipaddress
 import json
 import os
 import random
+import re
 import shlex
 import shutil
 import socket
@@ -37,6 +39,8 @@ LABEL_WORKTREE = "agent-containers.worktree"
 LABEL_ROLE = "agent-containers.role"
 LABEL_TARGET = "agent-containers.target"
 LABEL_PORTS = "agent-containers.ports"
+LABEL_REPO = "agent-containers.repo"
+LABEL_CACHE = "agent-containers.cache"
 QUICK_TIMEOUT = 60
 SUBNET_ATTEMPTS = 20
 SUBNET_POOLS = tuple(ipaddress.IPv4Network(n) for n in ("10.128.0.0/9", "172.16.0.0/12", "192.168.0.0/16"))
@@ -49,9 +53,15 @@ PRIVATE_IPV4 = tuple(ipaddress.IPv4Network(n) for n in ("10.0.0.0/8", "172.16.0.
 
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 
+_UNSAFE = re.compile(r"[^a-z0-9]+")
+
 
 def namespace() -> str:
     return os.environ.get(NAMESPACE_ENV) or DEFAULT_NAMESPACE
+
+
+def safe(name: str) -> str:
+    return _UNSAFE.sub("-", name.lower()).strip("-") or "x"
 
 
 @dataclass(frozen=True)
@@ -93,10 +103,11 @@ class Spec:
     target: Target
     image: str
     sidecars: tuple[Sidecar, ...] = ()
-    host_ports: dict[int, int] = field(default_factory=dict)
+    host_ports: dict[int | str, int] = field(default_factory=dict)
     denied: tuple[Network, ...] = ()
     git_mounts: tuple[tuple[str, str], ...] = ()
     ports_given: bool = True
+    repo: str = ""
 
     def labels(self, role: str) -> dict[str, str]:
         labels = {
@@ -106,30 +117,53 @@ class Spec:
             LABEL_ROLE: role,
         }
         if role == "target":
-            labels[LABEL_PORTS] = json.dumps({str(k): v for k, v in sorted(self.host_ports.items())})
+            ports = sorted((str(k), v) for k, v in self.host_ports.items())
+            labels[LABEL_PORTS] = json.dumps(dict(ports))
+            if self.cache:
+                labels[LABEL_CACHE] = self.cache
         return labels
+
+    @property
+    def cache(self) -> str:
+        if not self.target.cache:
+            return ""
+        repo = self.repo.lower()
+        digest = hashlib.sha256(f"{repo}\0{self.target.name}".encode()).hexdigest()[:8]
+        return f"ac-{self.names.namespace}-cache-{safe(repo.rpartition('/')[2])}-{safe(self.target.name)}-{digest}"
+
+    def cache_labels(self) -> dict[str, str]:
+        return {
+            LABEL_NAMESPACE: self.names.namespace,
+            LABEL_REPO: self.repo.lower(),
+            LABEL_TARGET: self.target.name,
+            LABEL_ROLE: "cache",
+        }
+
+    def shares_worktree(self, sidecar: Sidecar) -> bool:
+        return sidecar.name in self.target.worktree_sidecars
+
+    def port_environment(self) -> dict[str, str]:
+        return {port.env: str(self.host_ports[port.key]) for port in self.target.ports}
 
     def environment(self, proxy_ip: str) -> dict[str, str]:
         proxy = f"http://{proxy_ip}:{PROXY_PORT}"
         no_proxy = ",".join(["localhost", "127.0.0.1", self.target.name, *(s.name for s in self.sidecars)])
-        env = dict(self.target.environment)
-        for port in self.target.ports:
-            env[port.env] = str(self.host_ports[port.start])
+        env = {**self.target.environment, **self.port_environment()}
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
             env[key] = proxy
         env["NO_PROXY"] = env["no_proxy"] = no_proxy
         return env
 
-    def forwards(self) -> list[tuple[int, int]]:
+    def forwards(self) -> list[tuple[int, str, int]]:
         return [
-            (self.host_ports[port.start] + offset, port.start + offset)
+            (self.host_ports[port.key] + offset, port.service or self.target.name, port.start + offset)
             for port in self.target.ports
             for offset in range(port.count)
         ]
 
 
-def reserve_host_ports(ports: tuple[Port, ...], *, attempts: int = 50) -> dict[int, int]:
-    reserved: dict[int, int] = {}
+def reserve_host_ports(ports: tuple[Port, ...], *, attempts: int = 50) -> dict[int | str, int]:
+    reserved: dict[int | str, int] = {}
     held: list[socket.socket] = []
     try:
         for port in ports:
@@ -137,7 +171,7 @@ def reserve_host_ports(ports: tuple[Port, ...], *, attempts: int = 50) -> dict[i
                 block = _bind_block(port.count)
                 if block:
                     held.extend(block)
-                    reserved[port.start] = block[0].getsockname()[1]
+                    reserved[port.key] = block[0].getsockname()[1]
                     break
             else:
                 raise ToolError(f"no {port.count} consecutive free loopback ports for {port.start}-{port.end}")
@@ -396,11 +430,15 @@ class Runtime:
         ]
 
     def gateway_args(self, spec: Spec, addresses: Addresses) -> list[str]:
-        publishes = [item for host, port in spec.forwards() for item in ("--publish", f"127.0.0.1:{host}:{port}")]
+        forwards = spec.forwards()
+        publishes = [item for host, _, _ in forwards for item in ("--publish", f"127.0.0.1:{host}:{host}")]
         allow = [item for host in spec.target.hosts for item in ("--allow", host)]
         deny = [item for network in spec.denied for item in ("--deny", str(network))]
-        target_ip = addresses.services[spec.target.name]
-        forward = [item for _, port in spec.forwards() for item in ("--forward", f"{port}:{target_ip}:{port}")]
+        forward = [
+            item
+            for host, service, port in forwards
+            for item in ("--forward", f"{host}:{addresses.services[service]}:{port}")
+        ]
         return [
             "create",
             "--name",
@@ -426,6 +464,13 @@ class Runtime:
             *forward,
         ]
 
+    def worktree_args(self, spec: Spec) -> list[str]:
+        relabel = self.name == "podman" or sys.platform == "linux"
+        volumes = ["--volume", f"{spec.worktree}:{spec.mount}{':z' if relabel else ''}"]
+        for source, destination in spec.git_mounts:
+            volumes += ["--volume", f"{source}:{destination}:ro{',z' if relabel else ''}"]
+        return ["--init", "--cap-drop=ALL", *self.user_args(), *volumes, "--workdir", spec.mount]
+
     def sidecar_args(self, spec: Spec, sidecar: Sidecar, addresses: Addresses) -> list[str]:
         return [
             "run",
@@ -442,6 +487,7 @@ class Runtime:
             *addresses.host_flags(),
             "--security-opt",
             "no-new-privileges",
+            *(self.worktree_args(spec) if spec.shares_worktree(sidecar) else []),
             *flags("--env", sidecar.environment),
             *[item for v in sidecar.volumes for item in ("--volume", f"{spec.names.volume(v.name)}:{v.path}")],
             *_health_flags(sidecar),
@@ -451,12 +497,11 @@ class Runtime:
 
     def target_args(self, spec: Spec, addresses: Addresses) -> list[str]:
         target = spec.target
-        relabel = self.name == "podman" or sys.platform == "linux"
-        volumes = ["--volume", f"{spec.worktree}:{spec.mount}{':z' if relabel else ''}"]
-        for source, destination in spec.git_mounts:
-            volumes += ["--volume", f"{source}:{destination}:ro{',z' if relabel else ''}"]
+        volumes = []
         if target.state:
             volumes += ["--volume", f"{spec.names.state}:{target.state}"]
+        if target.cache:
+            volumes += ["--volume", f"{spec.cache}:{target.cache}"]
         for volume in target.volumes:
             volumes += ["--volume", f"{spec.names.volume(volume.name)}:{volume.path}"]
         devices = ["--device", "/dev/kvm"] if "kvm" in target.devices and sys.platform == "linux" else []
@@ -473,16 +518,12 @@ class Runtime:
             "--hostname",
             target.name,
             *addresses.host_flags(),
-            "--init",
-            "--cap-drop=ALL",
             "--security-opt",
             "no-new-privileges",
-            *self.user_args(),
+            *self.worktree_args(spec),
             *volumes,
             *devices,
             *flags("--env", spec.environment(addresses.gateway)),
-            "--workdir",
-            spec.mount,
             spec.image,
             "sh",
             "-c",

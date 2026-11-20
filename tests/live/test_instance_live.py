@@ -1,3 +1,4 @@
+import os
 import shutil
 import threading
 import time
@@ -45,10 +46,10 @@ services:{db}
 """
 
 
-def _instance(rt, image, namespace, worktree, compose=None, name=None):
+def _instance(rt, image, namespace, worktree, compose=None, name=None, repo=""):
     worktree.mkdir(parents=True, exist_ok=True)
     declaration = parse(compose or _compose())
-    spec = instances.make_spec(rt, declaration, "app", worktree, image, instance=name)
+    spec = instances.make_spec(rt, declaration, "app", worktree, image, instance=name, repo=repo)
     spec = runtime.Spec(**{**spec.__dict__, "names": runtime.Names(namespace, spec.names.instance)})
     return instances.Instance(rt, spec)
 
@@ -236,3 +237,95 @@ def test_a_symlink_planted_at_the_serve_log_leaves_its_target_untouched(rt, test
     inst.serve()
 
     assert secret.read_text() == "original"
+
+
+WORKTREE_SIDECAR = f"""
+services:
+  lod:
+    image: {runtime.GATEWAY_IMAGE}
+    command: ["python3", "-m", "http.server", "8081"]
+    volumes: [lodhome:/lod]
+  app:
+    build: .
+    x-agent:
+      worktree_sidecars: [lod]
+      ports: {{"lod:8081": {{env: LOD_PORT}}}}
+volumes:
+  lodhome:
+"""
+
+
+def test_a_worktree_sidecar_serves_the_worktree_and_writes_as_the_invoking_user(rt, test_image, namespace, tmp_path):
+    inst = _instance(rt, test_image, namespace, tmp_path / "wt", WORKTREE_SIDECAR)
+    (tmp_path / "wt" / "bundle.js").write_text("from-the-worktree")
+    inst.up()
+    lod = inst.spec.names.container("lod")
+
+    url = f"http://127.0.0.1:{inst.spec.host_ports['lod:8081']}/bundle.js"
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            body = urllib.request.urlopen(url, timeout=5).read().decode()
+            break
+        except OSError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.5)
+    assert body == "from-the-worktree"
+    rt.run(["exec", lod, "sh", "-c", "echo hi > written-by-lod && echo home > /lod/written"], what="write")
+    stat = (tmp_path / "wt" / "written-by-lod").stat()
+    assert (stat.st_uid, stat.st_gid) == (os.getuid(), os.getgid())
+
+
+CACHED = """
+services:
+  app:
+    build: .
+    x-agent:
+      cache: /cache
+      state: /state
+"""
+
+
+def test_instances_of_one_repo_and_target_share_a_cache_that_purging_keeps(rt, test_image, namespace, tmp_path):
+    first = _instance(rt, test_image, namespace, tmp_path / "one", CACHED, name="one", repo="org/repo")
+    second = _instance(rt, test_image, namespace, tmp_path / "two", CACHED, name="two", repo="org/repo")
+    other = _instance(rt, test_image, namespace, tmp_path / "three", CACHED, name="three", repo="org/other")
+    first.up()
+    assert first.run(["sh", "-c", "echo template > /cache/marker"]) == 0
+    second.up()
+    other.up()
+    assert _out(second, "cat", "/cache/marker") == (0, "template\n")
+    assert _out(other, "test", "-e", "/cache/marker")[0] != 0
+    assert rt.exists("volume", first.spec.names.state)
+
+    first.stop(purge=True)
+    rt.remove({runtime.LABEL_NAMESPACE: namespace, runtime.LABEL_WORKTREE: str(second.spec.worktree)}, volumes=True)
+    shutil.rmtree(tmp_path / "three")
+    instances.reap(rt, namespace)
+
+    assert rt.exists("volume", first.spec.cache)
+    assert rt.exists("volume", other.spec.cache)
+    assert not [i for i in (first, second, other) if rt.exists("volume", i.spec.names.state)]
+
+
+SCOPED = f"""
+services:
+  db:
+    image: {runtime.GATEWAY_IMAGE}
+    command: ["sleep", "infinity"]
+  redis:
+    image: {runtime.GATEWAY_IMAGE}
+    command: ["sleep", "infinity"]
+  app:
+    build: .
+    depends_on: [db]
+    x-agent: {{}}
+"""
+
+
+def test_a_target_starts_only_the_sidecars_it_depends_on(rt, test_image, namespace, tmp_path):
+    inst = _instance(rt, test_image, namespace, tmp_path / "wt", SCOPED)
+    inst.up()
+    started = rt.labelled("container", {runtime.LABEL_NAMESPACE: namespace, runtime.LABEL_ROLE: "sidecar"})
+    assert [c.name for c in started] == [inst.spec.names.container("db")]

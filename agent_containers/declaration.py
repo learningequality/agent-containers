@@ -14,7 +14,7 @@ from agent_containers.errors import ToolError
 DEVICES = ("kvm",)
 SERVE = "serve"
 PROXY_PORT = 3128
-X_AGENT_KEYS = frozenset({"commands", "hosts", "ports", "state", "ready", "devices"})
+X_AGENT_KEYS = frozenset({"commands", "hosts", "ports", "state", "cache", "ready", "devices", "worktree_sidecars"})
 READY_KEYS = frozenset({"timeout", "path", "port", "command"})
 
 _HOST_LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
@@ -34,6 +34,7 @@ class Port:
     start: int
     end: int
     env: str
+    service: str = ""
 
     def __post_init__(self) -> None:
         if not (0 < self.start <= self.end < 65536):
@@ -46,6 +47,10 @@ class Port:
     @property
     def count(self) -> int:
         return self.end - self.start + 1
+
+    @property
+    def key(self) -> int | str:
+        return f"{self.service}:{self.start}" if self.service else self.start
 
     def covers(self, port: int) -> bool:
         return self.start <= port <= self.end
@@ -98,8 +103,11 @@ class Target:
     hosts: tuple[str, ...] = ()
     ports: tuple[Port, ...] = ()
     state: str = ""
+    cache: str = ""
     ready: Ready | None = None
     devices: tuple[str, ...] = ()
+    worktree_sidecars: tuple[str, ...] = ()
+    depends_on: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         for device in self.devices:
@@ -109,14 +117,20 @@ class Target:
             _check_host(host)
         if SERVE in self.commands and self.ready is None:
             raise ValueError(f"target {self.name!r}: {SERVE} needs ready")
-        if self.ready and self.ready.port and not any(p.covers(self.ready.port) for p in self.ports):
+        if self.ready and self.ready.port and not any(p.covers(self.ready.port) for p in self.own_ports):
             raise ValueError(f"target {self.name!r}: ready's port {self.ready.port} is not a declared port")
-        if self.state and not self.state.startswith("/"):
-            raise ValueError(f"target {self.name!r}: state {self.state!r} is not an absolute path")
+        for key in ("state", "cache"):
+            path = getattr(self, key)
+            if path and not path.startswith("/"):
+                raise ValueError(f"target {self.name!r}: {key} {path!r} is not an absolute path")
 
     @property
     def serves(self) -> bool:
         return SERVE in self.commands
+
+    @property
+    def own_ports(self) -> tuple[Port, ...]:
+        return tuple(port for port in self.ports if not port.service)
 
 
 @dataclass(frozen=True)
@@ -137,6 +151,10 @@ class Sidecar:
 class Declaration:
     targets: dict[str, Target] = field(default_factory=dict)
     sidecars: dict[str, Sidecar] = field(default_factory=dict)
+
+    def sidecars_of(self, target: str) -> tuple[Sidecar, ...]:
+        wanted = self.targets[target].depends_on
+        return tuple(sidecar for name, sidecar in self.sidecars.items() if wanted is None or name in wanted)
 
 
 def load(path: Path) -> Declaration:
@@ -171,7 +189,38 @@ def _parse(text: str) -> Declaration:
     if targets and unrunnable:
         names = ", ".join(repr(name) for name in unrunnable)
         raise ValueError(f"service {names} needs an image or an x-agent block: the tool builds only targets")
+    for target in targets.values():
+        _check_services(target, sidecars, set(services))
     return Declaration(targets=targets, sidecars=sidecars)
+
+
+def _check_services(target: Target, sidecars: dict[str, Sidecar], services: set[str]) -> None:
+    for name in target.depends_on or ():
+        if name == target.name:
+            raise ValueError(f"target {target.name!r}: depends_on {name!r} names the target itself")
+        if name not in services:
+            raise ValueError(f"target {target.name!r}: depends_on {name!r} names no service")
+    scope = set(sidecars if target.depends_on is None else sidecars.keys() & set(target.depends_on))
+    within = "" if target.depends_on is None else "depends_on"
+    for port in target.ports:
+        if port.service:
+            span = str(port.start) if port.count == 1 else f"{port.start}-{port.end}"
+            what = f"port '{port.service}:{span}'"
+            _check_sidecar(target, what, port.service, scope, within, f"; write '{span}'")
+    for name in target.worktree_sidecars:
+        _check_sidecar(target, f"worktree_sidecars {name!r}", name, scope, within)
+
+
+def _check_sidecar(target: Target, what: str, name: str, scope: set[str], within: str = "", fix: str = "") -> None:
+    if name in scope:
+        return
+    where = f"target {target.name!r}: {what}"
+    if name == target.name:
+        raise ValueError(f"{where} names the target itself{fix}")
+    names = ", ".join(sorted(scope)) or "none"
+    if within:
+        raise ValueError(f"{where} names no sidecar in {within} ({within}: {names})")
+    raise ValueError(f"{where} names no sidecar (sidecars: {names})")
 
 
 def _target(name: str, service: dict[str, Any], named: set[str]) -> Target:
@@ -193,9 +242,22 @@ def _target(name: str, service: dict[str, Any], named: set[str]) -> Target:
         hosts=tuple(str(h) for h in _sequence(f"{where}: hosts", agent.get("hosts"))),
         ports=tuple(_port(str(k), v) for k, v in _mapping(f"{where}: ports", agent.get("ports")).items()),
         state=str(agent.get("state") or ""),
+        cache=str(agent.get("cache") or ""),
         ready=Ready(**{k: ready[k] for k in ("timeout", "path", "port", "command") if k in ready}) if ready else None,
         devices=tuple(str(d) for d in _sequence(f"{where}: devices", agent.get("devices"))),
+        worktree_sidecars=tuple(
+            str(s) for s in _sequence(f"{where}: worktree_sidecars", agent.get("worktree_sidecars"))
+        ),
+        depends_on=_depends_on(f"{where}: depends_on", service.get("depends_on")),
     )
+
+
+def _depends_on(where: str, value: Any) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (dict, list)):
+        raise ValueError(f"{where} is neither a list nor a mapping")
+    return tuple(str(name) for name in value)
 
 
 def _mapping(where: str, value: Any) -> dict[Any, Any]:
@@ -222,19 +284,20 @@ def _known_keys(where: str, value: Any, known: frozenset[str]) -> None:
 
 def _sidecar(name: str, service: dict[str, Any], named: set[str]) -> Sidecar:
     where = f"service {name!r}"
-    command = service.get("command")
     return Sidecar(
         name=name,
         image=str(service.get("image") or ""),
         environment=_environment(f"{where}: environment", service.get("environment")),
-        command=(
-            tuple(shlex.split(command))
-            if isinstance(command, str)
-            else tuple(str(c) for c in _sequence(f"{where}: command", command))
-        ),
+        command=_command(f"{where}: command", service.get("command")),
         healthcheck=_healthcheck(f"{where}: healthcheck", service.get("healthcheck")),
         volumes=_volumes(f"{where}: volumes", service.get("volumes"), named),
     )
+
+
+def _command(where: str, value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return tuple(shlex.split(value))
+    return tuple(str(c) for c in _sequence(where, value))
 
 
 def _build(value: Any) -> Build:
@@ -289,12 +352,13 @@ def _healthcheck(where: str, value: Any) -> Healthcheck | None:
 
 
 def _port(key: str, value: Any) -> Port:
-    start, sep, end = key.partition("-")
-    if not (start.isdigit() and (not sep or end.isdigit())):
+    service, named, span = key.rpartition(":")
+    start, sep, end = span.partition("-")
+    if not (start.isdigit() and (not sep or end.isdigit())) or (named and not service):
         raise ValueError(f"port {key!r} is neither a port nor a range")
     if not isinstance(value, dict) or "env" not in value:
         raise ValueError(f"port {key!r} needs {{env: VAR}}")
-    return Port(int(start), int(end or start), str(value["env"]))
+    return Port(int(start), int(end or start), str(value["env"]), service)
 
 
 def _check_host(host: str) -> None:

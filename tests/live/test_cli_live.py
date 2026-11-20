@@ -17,6 +17,7 @@ services:
       commands: {serve: "python3 -m http.server 8000"}
       ports: {"8000": {env: APP_PORT}}
       ready: {path: /, port: 8000, timeout: 60}
+      cache: /cache
 """
 
 
@@ -55,7 +56,10 @@ def test_serve_prints_a_url_that_answers_and_a_second_serve_reattaches(rt, repo,
 def test_stop_then_status_shows_nothing_running(rt, repo, capfd):
     assert cli.main(["run", "--local", "--runtime", rt.name, "--", "true"]) == 0
     assert cli.main(["status", "--runtime", rt.name]) == 0
-    assert "app" in capfd.readouterr().out
+    out = capfd.readouterr().out
+    assert "app" in out
+    cache = next(line.split("\t")[-1] for line in out.splitlines() if line.startswith("app\tcache\t"))
     assert cli.main(["stop", "--runtime", rt.name, "--purge"]) == 0
     assert cli.main(["status", "--runtime", rt.name]) == 0
     assert "app" not in capfd.readouterr().out
+    assert rt.exists("volume", cache)
